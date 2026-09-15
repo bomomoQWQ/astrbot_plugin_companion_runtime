@@ -26,7 +26,7 @@ docker run -d --name xiaojiujiu -p 127.0.0.1:8787:8787 \
 ```
 
 **第二步：安装本插件**。克隆到 AstrBot 的插件目录即可（本插件不在插件市场里，
-市场发布尚未提交）：
+市场发布**已冻结**，不是待办——见主仓库 `HANDOFF.md` 的「已冻结」一节）：
 
 ```bash
 git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git \
