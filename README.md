@@ -25,13 +25,15 @@ docker run -d --name xiaojiujiu -p 127.0.0.1:8787:8787 \
   -v xiaojiujiu-data:/data xiaojiujiu
 ```
 
-**第二步：安装本插件**。在 AstrBot WebUI 的「插件市场」搜索 `companion_runtime` 安装；
-或手动克隆到 AstrBot 的插件目录：
+**第二步：安装本插件**。克隆到 AstrBot 的插件目录即可（本插件不在插件市场里，
+市场发布尚未提交）：
 
 ```bash
 git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git \
   AstrBot/data/plugins/astrbot_plugin_companion_runtime
 ```
+
+也可以把仓库打成 zip，用 AstrBot WebUI 的「安装插件」上传。
 
 **第三步：把插件指向 Runtime**。在插件配置里设置 `runtime_base_url`：
 
