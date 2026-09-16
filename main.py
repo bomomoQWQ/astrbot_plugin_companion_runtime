@@ -195,6 +195,8 @@ class CompanionRuntimePlugin(Star):
         self._registry_seen = False
         #: Sessions already asked about, so one stranger cannot spam the fleet.
         self._provision_requested: set[str] = set()
+        #: Empty message events seen (AstrBot's notice-to-message conversions).
+        self._skipped_empty = 0
         self._tasks: list[asyncio.Task[None]] = []
         self._last_event_ids: OrderedDict[str, str] = OrderedDict()
         self._injection_warnings: set[str] = set()
@@ -498,10 +500,25 @@ class CompanionRuntimePlugin(Star):
                 # host ever evaluates handler filters differently.
                 return
             session = event.unified_msg_origin
+            text = as_str(getattr(event, "message_str", "")).strip()
+            if not text:
+                # AstrBot turns OneBot *notice* events (a poke, a friend request, a
+                # group membership change) into message events with an empty body and
+                # a generated message id -- measured on a real QQ: seven pokes became
+                # seven "user said nothing" reports, and the Runtime filed an empty
+                # ``用户说：`` fact for each. A user message with no text carries
+                # nothing to remember, so it is not reported; if a poke ever deserves
+                # cognition it needs its own event kind in the protocol.
+                self._skipped_empty += 1
+                self.logger.debug(
+                    "companion_runtime skipped an empty message event (notice?) in %s",
+                    session,
+                )
+                return
             record = EventRecord(
                 kind=EVENT_USER_MESSAGE,
                 session=session,
-                text=as_str(getattr(event, "message_str", "")),
+                text=text,
                 platform=as_str(event.get_platform_name()),
                 message_type=_message_type_name(event),
                 sender_id=as_str(event.get_sender_id()),
@@ -1103,6 +1120,11 @@ class CompanionRuntimePlugin(Star):
                 f"{len(queue)} pending, {stats.delivered} delivered, {stats.retried} retried, "
                 f"{stats.dropped()} dropped (full {stats.dropped_full}, "
                 f"failed {stats.dropped_failed}, expired {stats.dropped_expired})",
+            )
+        if self._skipped_empty:
+            lines.append(
+                f"- skipped empty events: {self._skipped_empty} "
+                "(AstrBot's notice-to-message conversions, e.g. pokes)",
             )
         if settings.issues:
             lines.append("- config issues:")

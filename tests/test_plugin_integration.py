@@ -692,6 +692,25 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(registry.provision_requests, [])
 
+    async def test_an_empty_message_event_is_not_reported(self) -> None:
+        """AstrBot turns OneBot notices (pokes, requests) into empty message events.
+
+        Measured on a real QQ: seven pokes became seven "user said nothing" reports
+        and the Runtime filed an empty ``用户说：`` fact for each.
+        """
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="", message_type="FriendMessage"),
+        )
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(transport.event_bodies, [], "an empty event must not be reported")
+        self.assertEqual(len(self.plugin._queue), 0)
+        self.assertEqual(self.plugin._skipped_empty, 1)
+
     async def test_disabled_plugin_does_nothing(self) -> None:
         plugin = await self._plugin(enabled=False)
         self.assertIsNone(plugin._queue)
