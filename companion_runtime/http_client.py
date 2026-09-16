@@ -177,27 +177,31 @@ class AiohttpRuntimeTransport:
         """Append an event envelope to the Runtime event log."""
         await self._request("POST", EVENTS_PATH, body=body, timeout_s=timeout_s)
 
-    async def fetch_routes(self, *, timeout_s: float) -> dict[str, str]:
+    async def fetch_routes(self, *, timeout_s: float) -> dict[str, str] | None:
         """Fetch the fleet's routing registry: ``{session: base_url}``.
 
         This is what makes provisioning a new person a fleet-side action instead of
         an AstrBot restart: the adapter asks the fleet which Runtime serves a
-        session it has not seen before. Fail-open by design -- an unreachable
-        registry means "no opinion", so the caller keeps whatever it already knew
-        and falls back to the default Runtime.
+        session it has not seen before.
+
+        ``None`` means the registry could not be read at all; an empty mapping means
+        it answered and knows nobody. The caller needs that difference: a registry
+        that is *down* must not hold messages hostage, while one that is *up* and
+        silent about a session is exactly the "just provisioned" case that must wait
+        rather than fall back and blend two people.
 
         Args:
             timeout_s: Per-request timeout.
 
         Returns:
-            The route map, or an empty mapping when it cannot be read.
+            The route map, or ``None`` when the registry cannot be read.
         """
         try:
             payload = await self._request("GET", ROUTES_PATH, body=None, timeout_s=timeout_s)
         except Exception:  # noqa: BLE001 - advisory lookup, never fatal
-            return {}
+            return None
         if not isinstance(payload, dict):
-            return {}
+            return None
         routes = payload.get("routes")
         if not isinstance(routes, dict):
             return {}

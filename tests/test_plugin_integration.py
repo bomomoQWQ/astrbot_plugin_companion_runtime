@@ -597,6 +597,46 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
 
+    async def test_a_message_for_an_unprovisioned_person_waits_for_the_registry(self) -> None:
+        """Never file one person's words into another person's Runtime.
+
+        A person provisioned moments ago is not in the registry cache yet. Falling
+        back to the default Runtime would blend them, so the report must wait for
+        the registry (the queue retries) and then go to the right instance.
+        """
+        newcomer = "webchat:FriendMessage:user-9"
+        await self._plugin(
+            route_registry_url="http://127.0.0.1:8898",
+            route_sync_interval_ms=2000,
+        )
+        registry = StubRuntimeTransport.instances[-1]  # built after the targets
+        default = StubRuntimeTransport.instances[0]
+        # The registry is reachable but does not know this person yet.
+        self.assertEqual(await self.plugin._sync_registry_once(), 0)
+
+        # First message arrives before the registry knows about them.
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="刚来报到", session=newcomer),
+        )
+        self.assertEqual(default.event_bodies, [], "the default Runtime must not receive it")
+        self.assertEqual(len(self.plugin._queue), 1, "the report must wait in the queue")
+
+        # The registry answers; the retry resolves and delivers to the right place.
+        registry.routes = {newcomer: "http://127.0.0.1:8899"}
+        self.assertTrue(
+            await wait_until(
+                lambda: len(StubRuntimeTransport.instances) == 3
+                and StubRuntimeTransport.instances[-1].event_bodies,
+                timeout_s=10.0,
+            ),
+            "the queued report must reach the newcomer's Runtime once routing is known",
+        )
+        routed = StubRuntimeTransport.instances[-1]
+        self.assertEqual(routed.base_url, "http://127.0.0.1:8899")
+        self.assertEqual(routed.event_bodies[0]["events"][0]["session"], newcomer)
+        self.assertEqual(default.event_bodies, [])
+
     async def test_disabled_plugin_does_nothing(self) -> None:
         plugin = await self._plugin(enabled=False)
         self.assertIsNone(plugin._queue)

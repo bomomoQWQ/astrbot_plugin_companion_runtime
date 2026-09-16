@@ -186,6 +186,10 @@ class CompanionRuntimePlugin(Star):
         self._registry_routes: dict[str, str] = {}
         self._registry_transport: AiohttpRuntimeTransport | None = None
         self._route_sync_pending = False
+        #: True once the registry has answered at least once. Until then an unknown
+        #: session falls back to the default Runtime; afterwards it waits, because a
+        #: registry that is up and silent means "this person is new", not "unknown".
+        self._registry_seen = False
         self._tasks: list[asyncio.Task[None]] = []
         self._last_event_ids: OrderedDict[str, str] = OrderedDict()
         self._injection_warnings: set[str] = set()
@@ -507,15 +511,7 @@ class CompanionRuntimePlugin(Star):
                 preempts_proactive=True,
             )
             self._remember_event_id(session, record.event_id)
-            self._enqueue_event(record, target=self._target_url(session))
-            if (
-                self._settings.registry_configured
-                and session not in self._registry_routes
-                and self._settings.static_route_for(session) is None
-            ):
-                # A person the fleet provisioned seconds ago: ask where they live,
-                # off this path, so their *first* message is already routed.
-                self._request_route_sync()
+            self._enqueue_event(record, target=self._route_target(session))
             bridge = self._bridge_for(session)
             if bridge is not None:
                 bridge.prefetch(self._context_request(event, trigger=TRIGGER_MESSAGE))
@@ -587,7 +583,7 @@ class CompanionRuntimePlugin(Star):
             wake=bool(getattr(event, "is_at_or_wake_command", False)),
         )
         self._remember_event_id(session, record.event_id)
-        self._enqueue_event(record, target=self._target_url(session))
+        self._enqueue_event(record, target=self._route_target(session))
         return True
 
     def _assistant_reported(self, event: AstrMessageEvent) -> bool:
@@ -677,7 +673,7 @@ class CompanionRuntimePlugin(Star):
             RuntimeTransportError: When the request cannot be delivered, which
                 makes the queue retry it with backoff.
         """
-        transport = self._transport_for(item.payload.get("target"))
+        transport = self._transport_for(item)
         if transport is None:
             raise RuntimeTransportError("Runtime transport is not available")
         operation = as_str(item.payload.get("op"))
@@ -691,6 +687,41 @@ class CompanionRuntimePlugin(Star):
             await transport.report_action(body, timeout_s=timeout_s)
         else:
             raise RuntimeTransportError(f"unknown queue operation {operation!r}")
+
+    def _transport_for(self, item: Any) -> Any:
+        """Return the client a queue item must go to, retrying until routing is known.
+
+        When the fleet registry has not yet answered for a session, the item carries
+        no target. Raising here is deliberate: the bounded retry queue will try
+        again in a moment with the freshly synced routes, whereas falling back to
+        the default Runtime would file one person's words into another person's
+        memory -- exactly the failure per-person routing exists to prevent.
+        """
+        payload = item.payload
+        target = as_str(payload.get("target")).strip()
+        if target:
+            return self._target_transport(target)
+        session = as_str(payload.get("session")).strip()
+        if session:
+            if self._routing_is_pending(session):
+                self._request_route_sync()
+                raise RuntimeTransportError(
+                    f"routing registry has not answered for session {session!r} yet",
+                )
+            return self._target_transport(self._target_url(session))
+        return self._target_transport(self._settings.base_url)
+
+    def _routing_is_pending(self, session: str) -> bool:
+        """Whether ``session`` should wait for the registry instead of falling back.
+
+        Only true once the registry has proven reachable: a registry that never
+        answered (or a deployment without one) must keep working exactly as before.
+        """
+        return (
+            self._settings.registry_configured
+            and self._registry_seen
+            and not self._route_known(session)
+        )
 
     def _target_reporter(self, url: str) -> Callable[[ActionReport], Awaitable[None]]:
         """Return a report coroutine bound to one Runtime.
@@ -745,13 +776,17 @@ class CompanionRuntimePlugin(Star):
         )
 
     def _enqueue_event(self, record: EventRecord, *, target: str) -> None:
-        """Queue one event report for ``target``; dropping beats blocking."""
+        """Queue one event report for ``target``; dropping beats blocking.
+
+        ``session`` travels with the item so a target that was unknown at enqueue
+        time can still be resolved when delivery is attempted.
+        """
         queue = self._queue
         if queue is None:
             return
         envelope = EventEnvelope(adapter_id=self._settings.adapter_id, events=[record])
         queue.put(
-            {"op": OP_EVENTS, "body": envelope.to_wire(), "target": target},
+            {"op": OP_EVENTS, "body": envelope.to_wire(), "target": target, "session": record.session},
             key=f"event:{record.event_id}",
         )
 
@@ -766,9 +801,23 @@ class CompanionRuntimePlugin(Star):
             return target.transport
         return None
 
-    def _transport_for(self, url: Any) -> Any:
-        """Return the client a queue item is addressed to (default when unset)."""
-        return self._target_transport(as_str(url).strip() or self._settings.base_url)
+    def _route_known(self, session: str) -> bool:
+        """Whether any route (static or registry) covers ``session``."""
+        return (
+            self._settings.static_route_for(session) is not None
+            or session in self._registry_routes
+        )
+
+    def _route_target(self, session: str) -> str:
+        """Return the queue target for ``session``; ``""`` while routing is unknown.
+
+        An empty target is not a fallback: :meth:`_transport_for` resolves it again
+        at delivery time and asks the queue to retry until the registry answers.
+        """
+        if self._routing_is_pending(session):
+            self._request_route_sync()
+            return ""
+        return self._target_url(session)
 
     def _bridge_for(self, session: str) -> ContextBridge | None:
         """Return the context bridge that serves ``session``.
@@ -848,12 +897,14 @@ class CompanionRuntimePlugin(Star):
             raise
         except Exception:
             # The real client already swallows its own failures, but the sync must
-            # stay fail-open for any transport implementation: an unreachable
-            # registry means "no opinion", never a broken adapter.
+            # stay fail-open for any transport implementation.
             self.logger.debug("companion_runtime registry read failed", exc_info=True)
             return 0
-        if not routes:
+        if routes is None:
+            # Unreachable: keep whatever we knew. Until it has answered once, unknown
+            # sessions fall back to the default Runtime rather than waiting forever.
             return 0
+        self._registry_seen = True
         self._registry_routes = routes
         for url in routes.values():
             self._ensure_target(url)
