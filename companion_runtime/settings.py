@@ -151,6 +151,18 @@ class Settings:
     hashable.
     """
 
+    route_registry_url: str = ""
+    """Fleet routing registry (``scripts/runtime_fleet.py``), or empty when absent.
+
+    With a registry the adapter does not need a config entry per person: it asks
+    the fleet which address serves a session it has not seen and caches the answer,
+    so adding a person is a fleet-side action and AstrBot never restarts. An
+    explicit :attr:`session_routes` entry still wins.
+    """
+
+    route_sync_interval_s: float = 15.0
+    """How often the adapter re-reads the registry (also refreshed on demand)."""
+
     @property
     def usable(self) -> bool:
         """Whether the Runtime can be contacted at all."""
@@ -173,12 +185,25 @@ class Settings:
             The configured URL for the first (longest) matching prefix, otherwise
             :attr:`base_url`.
         """
-        if not self.session_routes:
-            return self.base_url
+        routed = self.static_route_for(session)
+        return routed if routed is not None else self.base_url
+
+    def static_route_for(self, session: str) -> str | None:
+        """Return the configured URL for ``session``, or ``None`` when unrouted.
+
+        Kept separate from :meth:`target_for` because the adapter layers a *dynamic*
+        registry on top: an explicit route must win, and "no static route" has to be
+        distinguishable from "routed to the default instance".
+        """
         for prefix, url in self.session_routes:
             if session.startswith(prefix):
                 return url
-        return self.base_url
+        return None
+
+    @property
+    def registry_configured(self) -> bool:
+        """Whether a routing registry is configured."""
+        return bool(self.route_registry_url)
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> Settings:
@@ -259,6 +284,14 @@ class Settings:
         )
         issues.extend(route_issues)
 
+        registry_url = as_str(data.get("route_registry_url")).strip().rstrip("/")
+        if registry_url and not registry_url.startswith(("http://", "https://")):
+            issues.append(
+                f"route_registry_url must start with http:// or https:// "
+                f"(got {registry_url!r}); the routing registry is disabled",
+            )
+            registry_url = ""
+
         return cls(
             enabled=as_bool(data.get("enabled"), True),
             base_url=base_url,
@@ -289,4 +322,6 @@ class Settings:
             debug=as_bool(data.get("debug"), False),
             issues=tuple(issues),
             session_routes=session_routes,
+            route_registry_url=registry_url,
+            route_sync_interval_s=seconds("route_sync_interval_ms", 15000.0, 2000.0, 600000.0),
         )

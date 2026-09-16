@@ -45,6 +45,10 @@ ACTION_AUTHORIZE_PATH = "/v1/actions/{action_id}/authorize"
 #: Advisory liveness and level probe. Read-only, never on the message path.
 HEALTH_PATH = "/health"
 
+#: The fleet supervisor's routing registry (``scripts/runtime_fleet.py``). A plain
+#: Runtime does not serve it, which is why the lookup is fail-open.
+ROUTES_PATH = "/fleet/routes"
+
 #: Response bodies echoed into debug logs are truncated to this length.
 ERROR_BODY_LOG_LIMIT = 200
 
@@ -172,6 +176,36 @@ class AiohttpRuntimeTransport:
     async def post_events(self, body: dict[str, Any], *, timeout_s: float) -> None:
         """Append an event envelope to the Runtime event log."""
         await self._request("POST", EVENTS_PATH, body=body, timeout_s=timeout_s)
+
+    async def fetch_routes(self, *, timeout_s: float) -> dict[str, str]:
+        """Fetch the fleet's routing registry: ``{session: base_url}``.
+
+        This is what makes provisioning a new person a fleet-side action instead of
+        an AstrBot restart: the adapter asks the fleet which Runtime serves a
+        session it has not seen before. Fail-open by design -- an unreachable
+        registry means "no opinion", so the caller keeps whatever it already knew
+        and falls back to the default Runtime.
+
+        Args:
+            timeout_s: Per-request timeout.
+
+        Returns:
+            The route map, or an empty mapping when it cannot be read.
+        """
+        try:
+            payload = await self._request("GET", ROUTES_PATH, body=None, timeout_s=timeout_s)
+        except Exception:  # noqa: BLE001 - advisory lookup, never fatal
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        routes = payload.get("routes")
+        if not isinstance(routes, dict):
+            return {}
+        return {
+            str(session): str(url).rstrip("/")
+            for session, url in routes.items()
+            if isinstance(url, str) and url.startswith(("http://", "https://"))
+        }
 
     async def fetch_health(self, *, timeout_s: float) -> dict[str, Any] | None:
         """Fetch the Runtime health payload, or ``None`` when unavailable.

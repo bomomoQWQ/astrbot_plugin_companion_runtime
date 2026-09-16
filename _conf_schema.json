@@ -69,6 +69,18 @@
     "default": {},
     "hint": "形如 {\"aiocqhttp:FriendMessage:10001\": \"http://runtime-b:8787\"}。键是会话（AstrBot 的 unified_msg_origin）或其前缀，最长前缀优先；未列出的会话走 runtime_base_url。为什么要用它：Runtime 的长期记忆不按会话分区（memories 表没有 conversation_id 列），所以「好几个人各自和它 1v1」时必须一个人一个 Runtime，否则几个人会共用同一个角色的同一份记忆。留空表示单实例部署，行为与以前完全一致。"
   },
+  "route_registry_url": {
+    "description": "路由注册表（fleet 控制面，可选）",
+    "type": "string",
+    "default": "",
+    "hint": "填 fleet 的控制面地址（如 http://runtime-fleet:8800）。插件会定期读取 /fleet/routes，自动为新的会话接上它自己的 Runtime 实例——于是「加一个人」只是 fleet 那边的事，AstrBot 不需要重启、配置也不用改。留空表示只用 session_routes。显式的 session_routes 条目优先于注册表。"
+  },
+  "route_sync_interval_ms": {
+    "description": "读取路由注册表的间隔（毫秒）",
+    "type": "int",
+    "default": 15000,
+    "hint": "范围 2000–600000。此外，收到「没有路由覆盖」的会话消息时会额外立刻查一次，所以刚 provision 好的人第一条消息就能走对实例。"
+  },
   "report_assistant_messages": {
     "description": "上报机器人实际发出的消息",
     "type": "bool",

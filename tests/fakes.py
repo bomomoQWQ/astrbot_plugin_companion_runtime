@@ -109,6 +109,10 @@ class FakeTransport:
         self.health_calls = 0
         self.context_calls = 0
         self.closed = False
+        #: Registry answers for ``fetch_routes`` (``{session: url}``).
+        self.routes: dict[str, str] = {}
+        self.route_calls = 0
+        self.route_error: Exception | None = None
 
     async def fetch_health(self, *, timeout_s: float) -> dict[str, Any] | None:
         """Return the configured advisory health payload, or ``None``."""
@@ -116,6 +120,13 @@ class FakeTransport:
         if self.health_error is not None:
             raise self.health_error
         return self.health
+
+    async def fetch_routes(self, *, timeout_s: float) -> dict[str, str]:
+        """Return the fleet routing registry this double was given."""
+        self.route_calls += 1
+        if self.route_error is not None:
+            raise self.route_error
+        return dict(self.routes)
 
     async def post_events(self, body: dict[str, Any], *, timeout_s: float) -> None:
         self.event_bodies.append(body)

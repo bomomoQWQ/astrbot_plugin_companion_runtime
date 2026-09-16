@@ -540,6 +540,63 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
             settings.issues,
         )
 
+    async def test_the_registry_adds_a_target_without_a_restart(self) -> None:
+        """Adding a person must be a fleet-side action, not an AstrBot restart.
+
+        The adapter asks the fleet which Runtime serves a session it has not seen.
+        """
+        other_session = "webchat:FriendMessage:user-9"
+        await self._plugin(route_registry_url="http://127.0.0.1:8898")
+        registry = StubRuntimeTransport.instances[-1]
+        self.assertEqual(registry.base_url, "http://127.0.0.1:8898")
+        registry.routes = {other_session: "http://127.0.0.1:8899"}
+
+        self.assertEqual(await self.plugin._sync_registry_once(), 1)
+        self.assertEqual(len(StubRuntimeTransport.instances), 3)
+        routed = StubRuntimeTransport.instances[-1]
+        self.assertEqual(routed.base_url, "http://127.0.0.1:8899")
+        self.assertIsNotNone(self.plugin._targets["http://127.0.0.1:8899"].outbox)
+
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="刚来报到", session=other_session),
+        )
+
+        self.assertTrue(await wait_until(lambda: len(routed.event_bodies) == 1))
+        self.assertEqual(routed.event_bodies[0]["events"][0]["text"], "刚来报到")
+        # The registry's own client must never receive message traffic.
+        self.assertEqual(registry.event_bodies, [])
+
+    async def test_a_static_route_beats_the_registry(self) -> None:
+        """An operator's explicit route is a decision; the registry only fills gaps."""
+        session = "webchat:FriendMessage:user-2"
+        await self._plugin(
+            session_routes={session: "http://127.0.0.1:8897"},
+            route_registry_url="http://127.0.0.1:8898",
+        )
+        registry = StubRuntimeTransport.instances[-1]
+        registry.routes = {session: "http://127.0.0.1:8899"}
+
+        self.assertEqual(await self.plugin._sync_registry_once(), 1)
+
+        self.assertEqual(self.plugin._target_url(session), "http://127.0.0.1:8897")
+
+    async def test_an_unreachable_registry_falls_back_to_the_default(self) -> None:
+        """A fleet that is down must not take routing with it."""
+        await self._plugin(route_registry_url="http://127.0.0.1:8898")
+        registry = StubRuntimeTransport.instances[-1]
+        registry.route_error = RuntimeError("connection refused")
+
+        self.assertEqual(await self.plugin._sync_registry_once(), 0)
+        self.assertEqual(self.plugin._target_url("webchat:FriendMessage:user-9"), "http://127.0.0.1:8799")
+
+        transport = StubRuntimeTransport.instances[0]
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="hi", session="webchat:FriendMessage:user-9"),
+        )
+        self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
+
     async def test_disabled_plugin_does_nothing(self) -> None:
         plugin = await self._plugin(enabled=False)
         self.assertIsNone(plugin._queue)

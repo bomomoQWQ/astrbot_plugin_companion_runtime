@@ -180,6 +180,12 @@ class CompanionRuntimePlugin(Star):
         #: deployments, which is also what the tests and ``/companion_runtime``
         #: have always read.
         self._targets: dict[str, _RuntimeTarget] = {}
+        #: Session -> Runtime URL learned from the fleet's routing registry. This is
+        #: what makes "add a person" a fleet-side action: the adapter picks the new
+        #: route up on its own and AstrBot never restarts.
+        self._registry_routes: dict[str, str] = {}
+        self._registry_transport: AiohttpRuntimeTransport | None = None
+        self._route_sync_pending = False
         self._tasks: list[asyncio.Task[None]] = []
         self._last_event_ids: OrderedDict[str, str] = OrderedDict()
         self._injection_warnings: set[str] = set()
@@ -248,6 +254,8 @@ class CompanionRuntimePlugin(Star):
         queue, self._queue = self._queue, None
         bridges = [target.bridge for target in targets.values()]
         transports = [target.transport for target in targets.values()]
+        registry, self._registry_transport = self._registry_transport, None
+        self._registry_routes.clear()
         bridge, self._bridge = self._bridge, None
         transport, self._transport = self._transport, None
         self._outbox = None
@@ -261,6 +269,8 @@ class CompanionRuntimePlugin(Star):
                 await item.aclose()
             for item in transports:
                 await item.aclose()
+            if registry is not None:
+                await registry.aclose()
         except Exception:
             self.logger.warning("companion_runtime shutdown was not clean", exc_info=True)
 
@@ -360,11 +370,21 @@ class CompanionRuntimePlugin(Star):
                 self._tasks.append(
                     asyncio.create_task(consumer.run(), name="companion-runtime-outbox"),
                 )
+            if self._settings.registry_configured:
+                self._registry_transport = AiohttpRuntimeTransport(
+                    settings=self._settings,
+                    base_url=self._settings.route_registry_url,
+                    log=self.logger,
+                )
+                self._tasks.append(
+                    asyncio.create_task(self._route_sync_loop(), name="companion-runtime-routes"),
+                )
             queue.start()
         except Exception:
             # Nothing is running yet, so dropping the wiring is enough cleanup.
             self._tasks.clear()
             self._targets = {}
+            self._registry_transport = None
             self._transport = None
             self._executor = None
             self._queue = None
@@ -375,12 +395,13 @@ class CompanionRuntimePlugin(Star):
 
         self.logger.info(
             "companion_runtime adapter started (adapter_id=%s, base_url=%s, "
-            "observe_mode=%s, outbox=%s, targets=%s)",
+            "observe_mode=%s, outbox=%s, targets=%s, registry=%s)",
             self._settings.adapter_id,
             self._settings.base_url,
             self._settings.observe_mode,
             "on" if consumers else "off",
             ", ".join(self._settings.targets),
+            self._settings.route_registry_url or "off",
         )
 
     def _warn_if_whitelisted_out(self) -> None:
@@ -486,7 +507,15 @@ class CompanionRuntimePlugin(Star):
                 preempts_proactive=True,
             )
             self._remember_event_id(session, record.event_id)
-            self._enqueue_event(record, target=self._settings.target_for(session))
+            self._enqueue_event(record, target=self._target_url(session))
+            if (
+                self._settings.registry_configured
+                and session not in self._registry_routes
+                and self._settings.static_route_for(session) is None
+            ):
+                # A person the fleet provisioned seconds ago: ask where they live,
+                # off this path, so their *first* message is already routed.
+                self._request_route_sync()
             bridge = self._bridge_for(session)
             if bridge is not None:
                 bridge.prefetch(self._context_request(event, trigger=TRIGGER_MESSAGE))
@@ -558,7 +587,7 @@ class CompanionRuntimePlugin(Star):
             wake=bool(getattr(event, "is_at_or_wake_command", False)),
         )
         self._remember_event_id(session, record.event_id)
-        self._enqueue_event(record, target=self._settings.target_for(session))
+        self._enqueue_event(record, target=self._target_url(session))
         return True
 
     def _assistant_reported(self, event: AstrMessageEvent) -> bool:
@@ -748,8 +777,123 @@ class CompanionRuntimePlugin(Star):
         cache of the Runtime it is routed to -- reading the default one would
         inject another instance's context into this person's turn.
         """
-        target = self._targets.get(self._settings.target_for(session))
+        target = self._targets.get(self._target_url(session))
         return target.bridge if target is not None else None
+
+    def _target_url(self, session: str) -> str:
+        """Return the Runtime URL for ``session``: static route, registry, default.
+
+        Precedence is deliberate. An explicit ``session_routes`` entry is an
+        operator's decision and always wins; the registry is a fleet's answer and
+        fills the gaps; the default instance is the floor, so a deployment with
+        neither behaves exactly as it did before routing existed.
+        """
+        routed = self._settings.static_route_for(session)
+        if routed is not None:
+            return routed
+        return self._registry_routes.get(session, self._settings.base_url)
+
+    def _ensure_target(self, url: str) -> _RuntimeTarget | None:
+        """Build and start the bundle for a URL discovered at runtime.
+
+        Targets are normally built once in :meth:`_start`; a registry can name a
+        Runtime that did not exist then, so the same construction happens here.
+        """
+        cleaned = as_str(url).strip().rstrip("/")
+        if not cleaned:
+            return None
+        existing = self._targets.get(cleaned)
+        if existing is not None:
+            return existing
+        if not self._started or self._executor is None:
+            return None
+        transport = AiohttpRuntimeTransport(
+            settings=self._settings,
+            base_url=cleaned,
+            log=self.logger,
+        )
+        target = _RuntimeTarget(
+            transport=transport,
+            bridge=ContextBridge(transport=transport, settings=self._settings, log=self.logger),
+            url=cleaned,
+        )
+        self._targets[cleaned] = target
+        if self._settings.outbox_enabled:
+            consumer = OutboxConsumer(
+                transport=transport,
+                executor=self._executor,
+                reporter=self._target_reporter(cleaned),
+                settings=self._settings,
+                log=self.logger,
+            )
+            target.outbox = consumer
+            self._tasks.append(
+                asyncio.create_task(consumer.run(), name="companion-runtime-outbox"),
+            )
+        self.logger.info("companion_runtime added Runtime target %s", cleaned)
+        return target
+
+    async def _sync_registry_once(self) -> int:
+        """Read the registry and make every named Runtime reachable.
+
+        Returns:
+            How many routes the registry reported (0 when unavailable).
+        """
+        transport = self._registry_transport
+        if transport is None:
+            return 0
+        try:
+            routes = await transport.fetch_routes(timeout_s=self._settings.request_timeout_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The real client already swallows its own failures, but the sync must
+            # stay fail-open for any transport implementation: an unreachable
+            # registry means "no opinion", never a broken adapter.
+            self.logger.debug("companion_runtime registry read failed", exc_info=True)
+            return 0
+        if not routes:
+            return 0
+        self._registry_routes = routes
+        for url in routes.values():
+            self._ensure_target(url)
+        return len(routes)
+
+    async def _route_sync_loop(self) -> None:
+        """Keep the registry view fresh; never let a failure escape."""
+        while True:
+            try:
+                await self._sync_registry_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.debug("companion_runtime registry sync failed", exc_info=True)
+            await asyncio.sleep(max(2.0, self._settings.route_sync_interval_s))
+
+    def _request_route_sync(self) -> None:
+        """Ask the registry once, off the message path, for a session we cannot place.
+
+        Called when a message arrives for a session no route covers, so a person
+        provisioned seconds ago works on their first message instead of waiting for
+        the next periodic sync. Fire-and-forget: the message is handled with the
+        routes we already have.
+        """
+        if self._registry_transport is None or self._route_sync_pending:
+            return
+        self._route_sync_pending = True
+
+        async def once() -> None:
+            try:
+                await self._sync_registry_once()
+            except Exception:
+                self.logger.debug("companion_runtime registry lookup failed", exc_info=True)
+            finally:
+                self._route_sync_pending = False
+
+        try:
+            asyncio.get_running_loop().create_task(once())
+        except RuntimeError:
+            self._route_sync_pending = False
 
     def _remember_event_id(self, session: str, event_id: str) -> None:
         """Remember the newest reported event id for one session."""
@@ -832,6 +976,12 @@ class CompanionRuntimePlugin(Star):
                     f"  · {url}: {stats.leased} leased, {stats.rendered} rendered, "
                     f"{stats.sent} sent, {stats.failed} failed",
                 )
+        if settings.registry_configured:
+            lines.append(
+                f"- route registry: {settings.route_registry_url} "
+                f"({len(self._registry_routes)} sessions, {len(self._targets)} targets, "
+                f"every {settings.route_sync_interval_s:.0f}s)",
+            )
         lines.extend(await self._semantic_status_lines())
         bridge = self._bridge
         if bridge is not None:
