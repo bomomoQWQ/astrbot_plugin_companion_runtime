@@ -45,6 +45,54 @@ OBSERVE_MODES = (OBSERVE_MODE_WAKE, OBSERVE_MODE_ALL)
 DEFAULT_SESSION: str = "default"
 
 
+def _parse_session_routes(
+    raw: Any,
+    default_url: str,
+) -> tuple[tuple[tuple[str, str], ...], list[str]]:
+    """Normalize the ``session_routes`` config into sorted ``(prefix, url)`` pairs.
+
+    Sorted longest-prefix-first so :meth:`Settings.target_for` can take the first
+    match: with both ``aiocqhttp:FriendMessage`` and ``aiocqhttp:`` configured, the
+    narrower one has to win.
+
+    Args:
+        raw: The raw config value, expected to be ``{session-or-prefix: url}``.
+        default_url: The fallback Runtime address, used to drop no-op entries.
+
+    Returns:
+        ``(routes, issues)``; a malformed entry is dropped and reported rather
+        than taking the whole config down.
+    """
+    issues: list[str] = []
+    if raw in (None, "", {}):
+        return (), issues
+    if not isinstance(raw, Mapping):
+        issues.append(
+            "session_routes must be an object of {session: runtime url}; ignoring it",
+        )
+        return (), issues
+
+    routes: list[tuple[str, str]] = []
+    for key, value in raw.items():
+        session = as_str(key).strip()
+        url = as_str(value).strip().rstrip("/")
+        if not session or not url:
+            issues.append(f"session_routes[{session!r}] needs a non-empty url; ignored")
+            continue
+        if not url.startswith(("http://", "https://")):
+            issues.append(
+                f"session_routes[{session!r}] must start with http:// or https://; ignored",
+            )
+            continue
+        if url == default_url:
+            # Already the fallback: keeping it would only add a no-op target.
+            continue
+        routes.append((session, url))
+
+    routes.sort(key=lambda item: (-len(item[0]), item[0]))
+    return tuple(routes), issues
+
+
 @dataclass(frozen=True)
 class Settings:
     """Normalized adapter settings."""
@@ -89,10 +137,48 @@ class Settings:
     issues: tuple[str, ...] = ()
     """Human readable problems found while normalizing the config."""
 
+    session_routes: tuple[tuple[str, str], ...] = ()
+    """Per-session Runtime overrides, longest prefix first.
+
+    One AstrBot deployment can serve several Runtimes. The beta shape is exactly
+    that: several people, each in a private chat with the same bot, and a Runtime
+    holds one character's long-term memory -- ``memories`` has no conversation
+    column -- so a shared instance blends one person's facts into another's. A
+    session listed here (an exact ``unified_msg_origin`` or a prefix of one) talks
+    to its own Runtime; everything else uses :attr:`base_url`.
+
+    Kept as sorted pairs rather than a mapping so the frozen dataclass stays
+    hashable.
+    """
+
     @property
     def usable(self) -> bool:
         """Whether the Runtime can be contacted at all."""
         return self.enabled and bool(self.base_url)
+
+    @property
+    def targets(self) -> tuple[str, ...]:
+        """Every distinct Runtime base URL, the default one first."""
+        return tuple(
+            dict.fromkeys([self.base_url, *(url for _, url in self.session_routes)]),
+        )
+
+    def target_for(self, session: str) -> str:
+        """Return the Runtime base URL that owns ``session``.
+
+        Args:
+            session: The session the host reports, i.e. ``unified_msg_origin``.
+
+        Returns:
+            The configured URL for the first (longest) matching prefix, otherwise
+            :attr:`base_url`.
+        """
+        if not self.session_routes:
+            return self.base_url
+        for prefix, url in self.session_routes:
+            if session.startswith(prefix):
+                return url
+        return self.base_url
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> Settings:
@@ -167,6 +253,12 @@ class Settings:
             seconds("queue_max_backoff_ms", 30000.0, 500.0, 600000.0),
         )
 
+        session_routes, route_issues = _parse_session_routes(
+            data.get("session_routes"),
+            base_url,
+        )
+        issues.extend(route_issues)
+
         return cls(
             enabled=as_bool(data.get("enabled"), True),
             base_url=base_url,
@@ -196,4 +288,5 @@ class Settings:
             queue_send_timeout_s=seconds("queue_send_timeout_ms", 10000.0, 500.0, 120000.0),
             debug=as_bool(data.get("debug"), False),
             issues=tuple(issues),
+            session_routes=session_routes,
         )

@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent, filter
@@ -138,6 +140,22 @@ def _message_type_name(event: AstrMessageEvent) -> str:
     return MESSAGE_TYPE_NAMES.get(raw, raw)
 
 
+@dataclass
+class _RuntimeTarget:
+    """One Runtime this adapter talks to.
+
+    A target owns its own HTTP client, context cache and outbox poller, because
+    every one of those is scoped to a single Runtime: the cache is keyed by
+    session and the poller leases that instance's outbox. Sessions that are not
+    routed anywhere share the default target.
+    """
+
+    transport: Any
+    bridge: Any
+    outbox: Any = None
+    url: str = ""
+
+
 class CompanionRuntimePlugin(Star):
     """Host-side thin adapter for the companion Runtime."""
 
@@ -157,6 +175,11 @@ class CompanionRuntimePlugin(Star):
         self._bridge: ContextBridge | None = None
         self._outbox: OutboxConsumer | None = None
         self._executor: AstrBotActionExecutor | None = None
+        #: Every Runtime this adapter talks to, keyed by base URL. The three
+        #: attributes above mirror the *default* target for single-Runtime
+        #: deployments, which is also what the tests and ``/companion_runtime``
+        #: have always read.
+        self._targets: dict[str, _RuntimeTarget] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._last_event_ids: OrderedDict[str, str] = OrderedDict()
         self._injection_warnings: set[str] = set()
@@ -189,15 +212,22 @@ class CompanionRuntimePlugin(Star):
         self._started = False
         self._apply_observation_scope()
 
-        outbox, self._outbox = self._outbox, None
-        if outbox is not None:
+        targets = self._targets
+        outboxes = [target.outbox for target in targets.values() if target.outbox is not None]
+        if outboxes:
             # Bounded graceful stop. Leases that are already in flight are still
             # the Runtime's actions, and cancelling one *after* the Runtime
             # authorized an irreversible send is exactly how the same proactive
             # message ends up delivered twice, so give them a short window to
-            # finish and report before the tasks are cancelled.
-            outbox.request_stop()
-            if not await outbox.wait_idle(SHUTDOWN_GRACE_S):
+            # finish and report before the tasks are cancelled. Every routed
+            # Runtime gets the same window, in parallel, so the total wait stays
+            # ``SHUTDOWN_GRACE_S``.
+            for outbox in outboxes:
+                outbox.request_stop()
+            idle = await asyncio.gather(
+                *(outbox.wait_idle(SHUTDOWN_GRACE_S) for outbox in outboxes),
+            )
+            if not all(idle):
                 self.logger.warning(
                     "companion_runtime stopped with actions still in flight after %.0fs; "
                     "an authorized delivery that was already on the wire may finish "
@@ -212,19 +242,25 @@ class CompanionRuntimePlugin(Star):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Cleared only now: the graceful window above lets an in-flight delivery
+        # finish and *report*, and the report needs its target to still resolve.
+        self._targets = {}
         queue, self._queue = self._queue, None
+        bridges = [target.bridge for target in targets.values()]
+        transports = [target.transport for target in targets.values()]
         bridge, self._bridge = self._bridge, None
         transport, self._transport = self._transport, None
+        self._outbox = None
         self._executor = None
         self._last_event_ids.clear()
 
         try:
             if queue is not None:
                 await queue.stop()
-            if bridge is not None:
-                await bridge.aclose()
-            if transport is not None:
-                await transport.aclose()
+            for item in bridges:
+                await item.aclose()
+            for item in transports:
+                await item.aclose()
         except Exception:
             self.logger.warning("companion_runtime shutdown was not clean", exc_info=True)
 
@@ -262,7 +298,6 @@ class CompanionRuntimePlugin(Star):
             )
             return
         try:
-            transport = AiohttpRuntimeTransport(settings=self._settings, log=self.logger)
             executor = AstrBotActionExecutor(context=self.context, log=self.logger)
             queue = BoundedRetryQueue(
                 sender=self._deliver,
@@ -274,42 +309,62 @@ class CompanionRuntimePlugin(Star):
                 send_timeout_s=self._settings.queue_send_timeout_s,
                 log=self.logger,
             )
-            bridge = ContextBridge(
-                transport=transport,
-                settings=self._settings,
-                log=self.logger,
-            )
-            outbox = None
-            if self._settings.outbox_enabled:
-                outbox = OutboxConsumer(
-                    transport=transport,
-                    executor=executor,
-                    reporter=self._report_action,
+            # One client, one context cache and one outbox poller per Runtime: the
+            # cache is keyed by session and the poller leases that instance's
+            # outbox, so neither can be shared across targets.
+            targets: dict[str, _RuntimeTarget] = {}
+            for url in self._settings.targets:
+                transport = AiohttpRuntimeTransport(
                     settings=self._settings,
+                    base_url=url,
                     log=self.logger,
                 )
+                targets[url] = _RuntimeTarget(
+                    transport=transport,
+                    bridge=ContextBridge(
+                        transport=transport,
+                        settings=self._settings,
+                        log=self.logger,
+                    ),
+                    url=url,
+                )
+            consumers: list[OutboxConsumer] = []
+            if self._settings.outbox_enabled:
+                for url, target in targets.items():
+                    consumer = OutboxConsumer(
+                        transport=target.transport,
+                        executor=executor,
+                        reporter=self._target_reporter(url),
+                        settings=self._settings,
+                        log=self.logger,
+                    )
+                    target.outbox = consumer
+                    consumers.append(consumer)
         except Exception:
             self._note_start_failure(
                 "adapter could not be constructed; AstrBot behaviour is unchanged",
             )
             return
 
-        self._transport = transport
+        default = self._settings.base_url
+        self._targets = targets
+        self._transport = targets[default].transport
         self._executor = executor
         self._queue = queue
-        self._bridge = bridge
-        self._outbox = outbox
+        self._bridge = targets[default].bridge
+        self._outbox = targets[default].outbox
         self._apply_observation_scope()
 
         try:
-            if outbox is not None:
+            for consumer in consumers:
                 self._tasks.append(
-                    asyncio.create_task(outbox.run(), name="companion-runtime-outbox"),
+                    asyncio.create_task(consumer.run(), name="companion-runtime-outbox"),
                 )
             queue.start()
         except Exception:
             # Nothing is running yet, so dropping the wiring is enough cleanup.
             self._tasks.clear()
+            self._targets = {}
             self._transport = None
             self._executor = None
             self._queue = None
@@ -320,11 +375,12 @@ class CompanionRuntimePlugin(Star):
 
         self.logger.info(
             "companion_runtime adapter started (adapter_id=%s, base_url=%s, "
-            "observe_mode=%s, outbox=%s)",
+            "observe_mode=%s, outbox=%s, targets=%s)",
             self._settings.adapter_id,
             self._settings.base_url,
             self._settings.observe_mode,
-            "on" if outbox is not None else "off",
+            "on" if consumers else "off",
+            ", ".join(self._settings.targets),
         )
 
     def _warn_if_whitelisted_out(self) -> None:
@@ -430,8 +486,8 @@ class CompanionRuntimePlugin(Star):
                 preempts_proactive=True,
             )
             self._remember_event_id(session, record.event_id)
-            self._enqueue_event(record)
-            bridge = self._bridge
+            self._enqueue_event(record, target=self._settings.target_for(session))
+            bridge = self._bridge_for(session)
             if bridge is not None:
                 bridge.prefetch(self._context_request(event, trigger=TRIGGER_MESSAGE))
         except Exception:
@@ -502,7 +558,7 @@ class CompanionRuntimePlugin(Star):
             wake=bool(getattr(event, "is_at_or_wake_command", False)),
         )
         self._remember_event_id(session, record.event_id)
-        self._enqueue_event(record)
+        self._enqueue_event(record, target=self._settings.target_for(session))
         return True
 
     def _assistant_reported(self, event: AstrMessageEvent) -> bool:
@@ -539,7 +595,7 @@ class CompanionRuntimePlugin(Star):
 
     async def _inject_context(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         """Fetch and append the Runtime context block, fail-open on any problem."""
-        bridge = self._bridge
+        bridge = self._bridge_for(as_str(event.unified_msg_origin))
         if bridge is None or not self._settings.inject_enabled:
             return
         if TextPart is None:
@@ -592,7 +648,7 @@ class CompanionRuntimePlugin(Star):
             RuntimeTransportError: When the request cannot be delivered, which
                 makes the queue retry it with backoff.
         """
-        transport = self._transport
+        transport = self._transport_for(item.payload.get("target"))
         if transport is None:
             raise RuntimeTransportError("Runtime transport is not available")
         operation = as_str(item.payload.get("op"))
@@ -607,13 +663,28 @@ class CompanionRuntimePlugin(Star):
         else:
             raise RuntimeTransportError(f"unknown queue operation {operation!r}")
 
-    async def _report_action(self, report: ActionReport) -> None:
+    def _target_reporter(self, url: str) -> Callable[[ActionReport], Awaitable[None]]:
+        """Return a report coroutine bound to one Runtime.
+
+        Each outbox poller must report back to the instance that leased the
+        action: a report sent to the wrong Runtime leaves the action leased until
+        its deadline, and the delivery it describes would be unknown to the
+        Runtime that authorized it.
+        """
+
+        async def report(action_report: ActionReport) -> None:
+            await self._report_action(action_report, target=url)
+
+        return report
+
+    async def _report_action(self, report: ActionReport, *, target: str | None = None) -> None:
         """Report an action outcome, deferring to the retry queue when needed.
 
         Never raises: a lost report is recovered by the bounded local queue, and
         ultimately by the Runtime's own lease expiry.
         """
-        transport = self._transport
+        url = as_str(target).strip() or self._settings.base_url
+        transport = self._target_transport(url)
         if transport is None:
             return
         body = action_report_body(report)
@@ -626,7 +697,7 @@ class CompanionRuntimePlugin(Star):
             queue = self._queue
             if queue is not None:
                 queue.put(
-                    {"op": OP_ACTION_RESULT, "body": body},
+                    {"op": OP_ACTION_RESULT, "body": body, "target": url},
                     key=(
                         f"result:{report.action_id}:"
                         f"{report.attempt_id or report.lease_id}:{report.status}"
@@ -644,20 +715,41 @@ class CompanionRuntimePlugin(Star):
             last_event_id=self._last_event_ids.get(session),
         )
 
-    def _enqueue_event(self, record: EventRecord) -> None:
-        """Queue one event report; dropping it is preferable to blocking."""
+    def _enqueue_event(self, record: EventRecord, *, target: str) -> None:
+        """Queue one event report for ``target``; dropping beats blocking."""
         queue = self._queue
         if queue is None:
             return
         envelope = EventEnvelope(adapter_id=self._settings.adapter_id, events=[record])
         queue.put(
-            {"op": OP_EVENTS, "body": envelope.to_wire()},
+            {"op": OP_EVENTS, "body": envelope.to_wire(), "target": target},
             key=f"event:{record.event_id}",
         )
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+
+    def _target_transport(self, url: str) -> Any:
+        """Return the HTTP client for ``url``, or ``None`` when it is unknown."""
+        target = self._targets.get(url)
+        if target is not None:
+            return target.transport
+        return None
+
+    def _transport_for(self, url: Any) -> Any:
+        """Return the client a queue item is addressed to (default when unset)."""
+        return self._target_transport(as_str(url).strip() or self._settings.base_url)
+
+    def _bridge_for(self, session: str) -> ContextBridge | None:
+        """Return the context bridge that serves ``session``.
+
+        The bridge's cache is keyed by session, so a routed session must read the
+        cache of the Runtime it is routed to -- reading the default one would
+        inject another instance's context into this person's turn.
+        """
+        target = self._targets.get(self._settings.target_for(session))
+        return target.bridge if target is not None else None
 
     def _remember_event_id(self, session: str, event_id: str) -> None:
         """Remember the newest reported event id for one session."""
@@ -723,6 +815,23 @@ class CompanionRuntimePlugin(Star):
             f" every {settings.outbox_poll_interval_s:.1f}s"
             f" batch {settings.outbox_batch}",
         ]
+        if settings.session_routes:
+            # With several Runtimes the per-target numbers are the only way to see
+            # which instance is actually serving which person.
+            lines.append(f"- session routes: {len(settings.session_routes)}")
+            lines.extend(
+                f"  · {prefix} -> {url}" for prefix, url in settings.session_routes
+            )
+            for url in settings.targets:
+                target = self._targets.get(url)
+                if target is None or target.outbox is None:
+                    lines.append(f"  · {url}: not running")
+                    continue
+                stats = target.outbox.stats
+                lines.append(
+                    f"  · {url}: {stats.leased} leased, {stats.rendered} rendered, "
+                    f"{stats.sent} sent, {stats.failed} failed",
+                )
         lines.extend(await self._semantic_status_lines())
         bridge = self._bridge
         if bridge is not None:

@@ -56,9 +56,24 @@ class RuntimeTransportError(RuntimeError):
 class AiohttpRuntimeTransport:
     """Asynchronous HTTP client implementing :class:`RuntimeTransport`."""
 
-    def __init__(self, *, settings: Settings, log: Any = NULL_LOG) -> None:
-        """Create the transport; no connection is opened until the first call."""
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        base_url: str | None = None,
+        log: Any = NULL_LOG,
+    ) -> None:
+        """Create the transport; no connection is opened until the first call.
+
+        Args:
+            settings: Normalized adapter settings.
+            base_url: Override for the Runtime address. One adapter holds a client
+                per target when sessions are routed to different Runtimes, and the
+                override is what makes each client point at its own instance.
+            log: Logger-like object.
+        """
         self._settings = settings
+        self._base_url = (base_url or settings.base_url).rstrip("/")
         self._log = log
         self._session: Any = None
         self._session_loop: asyncio.AbstractEventLoop | None = None
@@ -123,7 +138,7 @@ class AiohttpRuntimeTransport:
                 unparseable JSON.
         """
         session = await self._client()
-        url = f"{self._settings.base_url}{path}"
+        url = f"{self._base_url}{path}"
         timeout = aiohttp.ClientTimeout(
             total=max(0.05, float(timeout_s)),
             connect=min(max(0.05, float(timeout_s)), 5.0),

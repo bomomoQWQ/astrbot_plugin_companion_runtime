@@ -166,9 +166,17 @@ class StubRuntimeTransport(FakeTransport):
 
     instances: list[StubRuntimeTransport] = []
 
-    def __init__(self, *, settings: Any = None, log: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Any = None,
+        base_url: str | None = None,
+        log: Any = None,
+    ) -> None:
         super().__init__()
         self.settings = settings
+        #: The address this client points at; one client is built per target.
+        self.base_url = base_url or (settings.base_url if settings is not None else "")
         self.log = log
         StubRuntimeTransport.instances.append(self)
 
@@ -440,6 +448,97 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertNoLogs("astrbot.plugin.stub", level="WARNING"):
             await plugin.initialize()
+
+    # -- session routing ---------------------------------------------------
+
+    async def test_sessions_route_to_their_own_runtime(self) -> None:
+        """Several people, each 1v1 with the same bot, need separate Runtimes.
+
+        A Runtime holds one character's long-term memory (``memories`` has no
+        conversation column), so two people sharing one instance would share one
+        memory of "the user".
+        """
+        other_session = "webchat:FriendMessage:user-2"
+        await self._plugin(session_routes={other_session: "http://127.0.0.1:8899"})
+        self.assertEqual(len(StubRuntimeTransport.instances), 2)
+        default, routed = StubRuntimeTransport.instances
+        self.assertEqual(default.base_url, "http://127.0.0.1:8799")
+        self.assertEqual(routed.base_url, "http://127.0.0.1:8899")
+
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="我是小周", session=other_session),
+        )
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="我是小林", session=SESSION),
+        )
+
+        self.assertTrue(
+            await wait_until(
+                lambda: len(routed.event_bodies) == 1 and len(default.event_bodies) == 1,
+            ),
+        )
+        self.assertEqual(routed.event_bodies[0]["events"][0]["text"], "我是小周")
+        self.assertEqual(default.event_bodies[0]["events"][0]["text"], "我是小林")
+        # The context caches must not be shared either: reading the default one
+        # would inject another instance's state into this person's turn.
+        self.assertIsNot(self.plugin._bridge_for(SESSION), self.plugin._bridge_for(other_session))
+
+    async def test_unrouted_sessions_use_the_default_runtime(self) -> None:
+        """A single-Runtime deployment must behave exactly as before."""
+        await self._plugin()
+        self.assertEqual(len(StubRuntimeTransport.instances), 1)
+        self.assertEqual(tuple(self.plugin._targets), ("http://127.0.0.1:8799",))
+        self.assertIs(self.plugin._bridge_for(SESSION), self.plugin._bridge)
+
+        await self._handler("on_message_observed")(self.plugin, StubMessageEvent(text="hi"))
+
+        transport = StubRuntimeTransport.instances[-1]
+        self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
+        self.assertEqual(transport.event_bodies[0]["events"][0]["text"], "hi")
+
+    async def test_every_routed_runtime_gets_its_own_outbox_poller(self) -> None:
+        """Each Runtime's outbox must be leased by a poller pointing at it."""
+        await self._plugin(
+            session_routes={"webchat:FriendMessage:user-2": "http://127.0.0.1:8899"},
+        )
+        self.assertEqual(len(self.plugin._targets), 2)
+        self.assertEqual(len(self.plugin._tasks), 2)
+        for target in self.plugin._targets.values():
+            self.assertIsNotNone(target.outbox)
+            self.assertIs(target.outbox._transport, target.transport)
+        self.assertIs(self.plugin._outbox, self.plugin._targets["http://127.0.0.1:8799"].outbox)
+
+    async def test_session_routes_are_prefix_matched_longest_first(self) -> None:
+        """A narrow route must win over a wide one, and bad entries must not land."""
+        settings = self.main.Settings.from_mapping(
+            {
+                "runtime_base_url": "http://a:8787",
+                "session_routes": {
+                    "webchat:": "http://b:8787",
+                    "webchat:FriendMessage:user-2": "http://c:8787",
+                    "bad": "not-a-url",
+                    "noop": "http://a:8787",
+                },
+            },
+        )
+
+        self.assertEqual(settings.target_for("webchat:FriendMessage:user-2"), "http://c:8787")
+        self.assertEqual(settings.target_for("webchat:GroupMessage:9"), "http://b:8787")
+        self.assertEqual(settings.target_for("aiocqhttp:FriendMessage:1"), "http://a:8787")
+        self.assertEqual(
+            settings.targets,
+            ("http://a:8787", "http://c:8787", "http://b:8787"),
+        )
+        self.assertEqual([prefix for prefix, _ in settings.session_routes], [
+            "webchat:FriendMessage:user-2",
+            "webchat:",
+        ])
+        self.assertTrue(
+            any("session_routes" in issue and "'bad'" in issue for issue in settings.issues),
+            settings.issues,
+        )
 
     async def test_disabled_plugin_does_nothing(self) -> None:
         plugin = await self._plugin(enabled=False)

@@ -63,6 +63,12 @@
     "hint": "wake（推荐）：只上报 AstrBot 本身就会处理的消息（私聊、@机器人、唤醒词、回复机器人）。all：上报全部消息，但会把这些消息标记为已唤醒并让它们继续走后续管线流程，可能改变限流/内容安全等阶段的行为，请确认后再开启。",
     "obvious_hint": true
   },
+  "session_routes": {
+    "description": "按会话分流到不同 Runtime（一人一实例）",
+    "type": "object",
+    "default": {},
+    "hint": "形如 {\"aiocqhttp:FriendMessage:10001\": \"http://runtime-b:8787\"}。键是会话（AstrBot 的 unified_msg_origin）或其前缀，最长前缀优先；未列出的会话走 runtime_base_url。为什么要用它：Runtime 的长期记忆不按会话分区（memories 表没有 conversation_id 列），所以「好几个人各自和它 1v1」时必须一个人一个 Runtime，否则几个人会共用同一个角色的同一份记忆。留空表示单实例部署，行为与以前完全一致。"
+  },
   "report_assistant_messages": {
     "description": "上报机器人实际发出的消息",
     "type": "bool",

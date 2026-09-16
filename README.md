@@ -189,6 +189,7 @@ AstrBot/
 | `runtime_base_url` | `http://127.0.0.1:8787` | Runtime HTTP 根地址（与 Runtime 自身默认端口一致） |
 | `runtime_token` | `""`（secret） | `Authorization: Bearer <token>`；可用环境变量 `COMPANION_RUNTIME_TOKEN` 代替，避免把密钥写进配置文件 |
 | `adapter_id` | `default` | 多个 AstrBot 实例接入同一 Runtime 时必须不同 |
+| `session_routes` | `{}` | **按会话分流到不同 Runtime**：`{"<会话或前缀>": "<url>"}`，最长前缀优先，未命中走 `runtime_base_url`。Runtime 的长期记忆不按会话分区，所以"好几个人各自和它 1v1"必须一人一个实例，见 §3「白名单」之后的说明 |
 | `request_timeout_ms` | `1500` | 普通请求超时 |
 | `context_timeout_ms` | `400` | **注入路径硬超时**，范围 50–2000，超出强制截断 |
 | `context_cache_ttl_ms` | `30000` | 缓存有效期；命中即零等待 |
