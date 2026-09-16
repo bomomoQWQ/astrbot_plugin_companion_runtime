@@ -57,6 +57,7 @@ from .protocol import (
     LeaseRequest,
     LeasedAction,
     RuntimeTransport,
+    TransportUnavailable,
     truncate_error,
 )
 from .retry_queue import NULL_LOG
@@ -458,6 +459,21 @@ class OutboxConsumer:
             )
         except asyncio.CancelledError:
             raise
+        except TransportUnavailable as exc:
+            # Same policy as an authorization outage, for the same reason: the
+            # platform link was down, so nothing was delivered and nothing should be
+            # reported. Reporting it would make the Runtime close the attempt for
+            # good over a connection blip, which is how a fully composed proactive
+            # message was lost once already. Left unreported, the lease expires and
+            # the Runtime re-dispatches the row while the attempt budget lasts.
+            self.stats.deferred += 1
+            self._log.warning(
+                "send for %s could not reach the platform (%s); message NOT sent and "
+                "left to the Runtime's lease-expiry recovery",
+                action.action_id,
+                exc,
+            )
+            return None
         except (asyncio.TimeoutError, TimeoutError):
             self.stats.failed += 1
             return self._stub(

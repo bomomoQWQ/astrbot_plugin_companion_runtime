@@ -57,6 +57,69 @@ ERROR_CHAR_LIMIT = 400
 PREVIEW_CHAR_LIMIT = 160
 
 
+class TransportUnavailable(RuntimeError):
+    """The host could not carry an action to its platform at all.
+
+    Distinct from a plain execution failure on purpose, because the two demand
+    opposite responses and can only be told apart by the adapter that knows its own
+    transport:
+
+    * an action that *failed* is a verdict -- the Runtime records it and the attempt
+      is over;
+    * an action whose transport was **unavailable** never reached anyone, so it is an
+      outage, and reporting it as a failure drops the message for good over a
+      connection blip. The outbox adapter therefore defers it: the lease is left to
+      expire and the Runtime's own recovery re-dispatches the row while the attempt
+      budget lasts.
+
+    Measured: a real proactive message ("东西调试完就去睡吧。另外昵称那条我没太看明白…")
+    was composed, authorized and rendered, then lost because ``aiocqhttp`` raised
+    ``ApiNotAvailable`` -- "OneBot API 不可用", which is exactly this case.
+    """
+
+    def __init__(self, message: str = "", *, error: BaseException | None = None) -> None:
+        """Store the single-line reason and, when there is one, the original error."""
+        super().__init__(message)
+        self.error = error
+
+
+#: Exception class names that mean "the platform link could not carry the call".
+#:
+#: ``aiocqhttp``'s ``NetworkError`` is generic enough that another library could use
+#: the same name, so it is only accepted when it really comes from ``aiocqhttp``.
+#: ``ApiNotAvailable`` is distinctive to that client and is accepted on its name.
+_TRANSPORT_ERROR_NAMES = frozenset({"ApiNotAvailable"})
+_AIOCQHTTP_NETWORK_ERROR = "NetworkError"
+_AIOCQHTTP_MODULE_PREFIX = "aiocqhttp"
+
+
+def is_transport_unavailable(error: BaseException) -> bool:
+    """Return whether ``error`` means "the platform link was down".
+
+    Deliberately classified by the exception's *name and module* rather than by
+    importing it: this package must stay importable without AstrBot or aiocqhttp
+    (that is what makes the adapter logic unit-testable), and the host may vendor a
+    different version of the client than the one this code could import.
+
+    The distinction matters because the two cases need opposite responses: a
+    transport outage means nothing was delivered, so the action should be
+    re-dispatched; any other failure is a verdict about the message.
+
+    Args:
+        error: The exception raised while talking to the platform.
+
+    Returns:
+        ``True`` for ``aiocqhttp``'s "the OneBot API is not available" family.
+    """
+    error_type = type(error)
+    name = error_type.__name__
+    if name in _TRANSPORT_ERROR_NAMES:
+        return True
+    if name == _AIOCQHTTP_NETWORK_ERROR:
+        return _AIOCQHTTP_MODULE_PREFIX in (getattr(error_type, "__module__", "") or "")
+    return False
+
+
 def utc_now_iso() -> str:
     """Return the current UTC time as an ISO-8601 string with a ``Z`` suffix."""
     return (

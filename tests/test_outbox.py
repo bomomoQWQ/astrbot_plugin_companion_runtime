@@ -17,6 +17,8 @@ from companion_runtime.protocol import (
     STATUS_SKIPPED,
     AuthorizeDecision,
     LeasedAction,
+    TransportUnavailable,
+    is_transport_unavailable,
 )
 from companion_runtime.settings import Settings
 from tests.fakes import (
@@ -250,6 +252,87 @@ class OutboxConsumerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(collector.reports, [])
         self.assertEqual(consumer.stats.deferred, 1)
         self.assertEqual(consumer.stats.authorize_errors, 1)
+
+    async def test_unreachable_platform_leaves_the_action_retryable(self) -> None:
+        """A dead platform link is an outage, not a verdict about the message.
+
+        Measured on the real deployment: a composed, authorized, rendered proactive
+        message ("东西调试完就去睡吧。另外昵称那条我没太看明白…") was lost because
+        ``aiocqhttp`` raised ``ApiNotAvailable`` -- "OneBot API 不可用" -- while the
+        OneBot connection was down. The adapter turned that into a ``failed`` report,
+        the Runtime closed the attempt for good, and the message never went out.
+        Nothing had been delivered, so silence (lease expiry -> re-dispatch) is the
+        only honest shape here, exactly as for an unreachable Runtime.
+        """
+        action = _action(payload={"text": "在忙吗"})
+        transport = FakeTransport(actions=[action])
+        executor = FakeExecutor(
+            send_error=TransportUnavailable("send_message transport unavailable: ApiNotAvailable:"),
+        )
+        consumer, collector = self._consumer(transport, executor)
+
+        await consumer.poll_once()
+
+        self.assertEqual(len(executor.send_calls), 1, "it was attempted")
+        self.assertEqual(collector.reports, [], "no terminal outcome may be reported")
+        self.assertEqual(transport.report_bodies, [])
+        self.assertEqual(consumer.stats.deferred, 1)
+        self.assertEqual(consumer.stats.failed, 0, "nothing was delivered, so nothing failed")
+        self.assertFalse(consumer._completed, "a deferred action must stay re-leaseable")
+        self.assertTrue(
+            any("could not reach the platform" in text for text in consumer._log.levels("warning")),
+            "the deferral has to be visible to an operator somewhere",
+        )
+
+    async def test_a_real_send_failure_is_still_terminal(self) -> None:
+        """The counterpart guard: only transport outages are deferred.
+
+        A genuine execution failure (no provider, platform refused, delivery
+        returned ``sent=False``) must keep travelling to the Runtime as a verdict,
+        or a broken session would be retried forever instead of being recorded.
+        """
+        action = _action(payload={"text": "在忙吗"})
+        transport = FakeTransport(actions=[action])
+        executor = FakeExecutor(send_error=RuntimeError("platform refused"))
+        consumer, collector = self._consumer(transport, executor)
+
+        await consumer.poll_once()
+
+        self.assertEqual(consumer.stats.deferred, 0)
+        self.assertEqual(consumer.stats.failed, 1)
+        report = collector.reports[0]
+        self.assertEqual(report.status, STATUS_FAILED)
+        self.assertIn("platform refused", report.error)
+
+    def test_transport_classification_survives_the_host_error_shape(self) -> None:
+        """The classifier has to work without importing aiocqhttp.
+
+        The executor runs inside AstrBot, where the client is provided by the host,
+        and this package must stay importable without it -- so the decision is made
+        from the exception's name and module. The real deployment raised exactly
+        ``aiocqhttp.exceptions.ApiNotAvailable`` with an empty message.
+        """
+        api_not_available = type("ApiNotAvailable", (Exception,), {})
+        api_not_available.__module__ = "aiocqhttp.exceptions"
+        self.assertTrue(is_transport_unavailable(api_not_available()))
+        # A same-named exception from somewhere else is still the client's message:
+        # the name is distinctive to aiocqhttp.
+        bare = type("ApiNotAvailable", (Exception,), {})
+        self.assertTrue(is_transport_unavailable(bare()))
+
+        aiocqhttp_network = type("NetworkError", (Exception,), {})
+        aiocqhttp_network.__module__ = "aiocqhttp.exceptions"
+        self.assertTrue(is_transport_unavailable(aiocqhttp_network()))
+        foreign_network = type("NetworkError", (Exception,), {})
+        foreign_network.__module__ = "httpx"
+        self.assertFalse(
+            is_transport_unavailable(foreign_network()),
+            "a generic NetworkError from another library is not a OneBot outage",
+        )
+
+        # The failures that must stay verdicts.
+        self.assertFalse(is_transport_unavailable(RuntimeError("platform refused")))
+        self.assertFalse(is_transport_unavailable(asyncio.TimeoutError()))
 
     async def test_authorization_can_amend_the_text(self) -> None:
         action = _action(payload={"text": "原措辞"})

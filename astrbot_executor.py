@@ -23,7 +23,12 @@ from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain
 
 from .companion_runtime.coerce import as_int, as_str
-from .companion_runtime.protocol import LeasedAction, truncate_error
+from .companion_runtime.protocol import (
+    LeasedAction,
+    TransportUnavailable,
+    is_transport_unavailable,
+    truncate_error,
+)
 from .companion_runtime.retry_queue import NULL_LOG
 
 
@@ -102,6 +107,8 @@ class AstrBotActionExecutor:
             rather than as a delivered message.
 
         Raises:
+            TransportUnavailable: If the platform link was down, so nothing was
+                delivered and the action is worth re-dispatching.
             ActionExecutionError: If the text is empty or AstrBot rejects the
                 session.
         """
@@ -112,6 +119,13 @@ class AstrBotActionExecutor:
         try:
             delivered = await self._context.send_message(action.session, chain)
         except Exception as exc:
+            if is_transport_unavailable(exc):
+                # Nothing reached the user, and the reason is a disconnected OneBot
+                # rather than a rejected message, so this must not be reported as a
+                # terminal delivery failure.
+                raise TransportUnavailable(
+                    f"send_message transport unavailable: {truncate_error(exc)}", error=exc
+                ) from exc
             raise ActionExecutionError(f"send_message failed: {truncate_error(exc)}") from exc
         return {"sent": bool(delivered), "chars": len(body)}
 
