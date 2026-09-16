@@ -637,6 +637,61 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routed.event_bodies[0]["events"][0]["session"], newcomer)
         self.assertEqual(default.event_bodies, [])
 
+    async def test_an_unknown_person_is_provisioned_automatically(self) -> None:
+        """A tester's first message must not need an operator.
+
+        With ``route_auto_provision`` the adapter asks the fleet to create the
+        instance, then the waiting report is delivered into it -- the whole point of
+        the closed beta being "just talk to it".
+        """
+        newcomer = "webchat:FriendMessage:user-9"
+        await self._plugin(
+            route_registry_url="http://127.0.0.1:8898",
+            route_auto_provision=True,
+            route_sync_interval_ms=2000,
+        )
+        registry = StubRuntimeTransport.instances[-1]
+        self.assertEqual(await self.plugin._sync_registry_once(), 0)  # reachable, knows nobody
+
+        registry.provision_result = "http://127.0.0.1:8899"
+
+        async def provision(session: str, *, timeout_s: float) -> str:
+            registry.routes = {session: "http://127.0.0.1:8899"}
+            return "http://127.0.0.1:8899"
+
+        registry.provision_session = provision  # type: ignore[assignment]
+
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="第一次说话", session=newcomer),
+        )
+
+        self.assertTrue(
+            await wait_until(
+                lambda: any(
+                    item.base_url == "http://127.0.0.1:8899" and item.event_bodies
+                    for item in StubRuntimeTransport.instances
+                ),
+                timeout_s=10.0,
+            ),
+            "the newcomer's first message must reach the instance created for them",
+        )
+        self.assertEqual(StubRuntimeTransport.instances[0].event_bodies, [])
+
+    async def test_auto_provision_is_off_by_default(self) -> None:
+        """Growing the fleet is a deployment decision, not an adapter default."""
+        await self._plugin(route_registry_url="http://127.0.0.1:8898")
+        registry = StubRuntimeTransport.instances[-1]
+        await self.plugin._sync_registry_once()
+
+        await self._handler("on_message_observed")(
+            self.plugin,
+            StubMessageEvent(text="陌生人", session="webchat:FriendMessage:user-9"),
+        )
+        await asyncio.sleep(0.1)
+
+        self.assertEqual(registry.provision_requests, [])
+
     async def test_disabled_plugin_does_nothing(self) -> None:
         plugin = await self._plugin(enabled=False)
         self.assertIsNone(plugin._queue)

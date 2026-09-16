@@ -49,6 +49,9 @@ HEALTH_PATH = "/health"
 #: Runtime does not serve it, which is why the lookup is fail-open.
 ROUTES_PATH = "/fleet/routes"
 
+#: Ask the fleet to create a Runtime for a session it has never seen.
+PROVISION_PATH = "/fleet/provision"
+
 #: Response bodies echoed into debug logs are truncated to this length.
 ERROR_BODY_LOG_LIMIT = 200
 
@@ -210,6 +213,35 @@ class AiohttpRuntimeTransport:
             for session, url in routes.items()
             if isinstance(url, str) and url.startswith(("http://", "https://"))
         }
+
+    async def provision_session(self, session: str, *, timeout_s: float) -> str | None:
+        """Ask the fleet to start a Runtime for ``session``.
+
+        Used when a person the fleet has never heard of writes for the first time:
+        the adapter asks for an instance instead of filing their words into somebody
+        else's. Advisory like the rest of the fleet surface -- a failure just means
+        "not this time", and the caller keeps retrying through the message queue.
+
+        Args:
+            session: Session to provision.
+            timeout_s: Per-request timeout.
+
+        Returns:
+            The address of the new Runtime, or ``None`` when provisioning failed.
+        """
+        try:
+            payload = await self._request(
+                "POST",
+                PROVISION_PATH,
+                body={"session": session},
+                timeout_s=timeout_s,
+            )
+        except Exception:  # noqa: BLE001 - advisory call, never fatal
+            return None
+        if not isinstance(payload, dict):
+            return None
+        url = payload.get("url")
+        return str(url).rstrip("/") if isinstance(url, str) and url.startswith("http") else None
 
     async def fetch_health(self, *, timeout_s: float) -> dict[str, Any] | None:
         """Fetch the Runtime health payload, or ``None`` when unavailable.

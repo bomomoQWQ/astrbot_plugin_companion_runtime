@@ -113,6 +113,10 @@ class FakeTransport:
         self.routes: dict[str, str] = {}
         self.route_calls = 0
         self.route_error: Exception | None = None
+        #: Provision requests the adapter made, and what the fleet answers with.
+        self.provision_requests: list[str] = []
+        self.provision_result: str | None = None
+        self.provision_error: Exception | None = None
 
     async def fetch_health(self, *, timeout_s: float) -> dict[str, Any] | None:
         """Return the configured advisory health payload, or ``None``."""
@@ -127,6 +131,13 @@ class FakeTransport:
         if self.route_error is not None:
             raise self.route_error
         return dict(self.routes)
+
+    async def provision_session(self, session: str, *, timeout_s: float) -> str | None:
+        """Record a provision request and report the address the fleet would use."""
+        self.provision_requests.append(session)
+        if self.provision_error is not None:
+            raise self.provision_error
+        return self.provision_result
 
     async def post_events(self, body: dict[str, Any], *, timeout_s: float) -> None:
         self.event_bodies.append(body)

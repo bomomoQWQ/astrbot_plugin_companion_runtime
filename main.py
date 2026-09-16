@@ -76,6 +76,9 @@ LAST_EVENT_ID_CACHE = 64
 #: How many times a failing start is retried before the adapter gives up quietly.
 MAX_START_ATTEMPTS = 3
 
+#: How many unknown sessions may trigger an automatic provision request.
+AUTO_PROVISION_LIMIT = 64
+
 #: Event extra that records an assistant turn already reported for this message.
 ASSISTANT_REPORTED_EXTRA = "companion_runtime_assistant_reported"
 
@@ -190,6 +193,8 @@ class CompanionRuntimePlugin(Star):
         #: session falls back to the default Runtime; afterwards it waits, because a
         #: registry that is up and silent means "this person is new", not "unknown".
         self._registry_seen = False
+        #: Sessions already asked about, so one stranger cannot spam the fleet.
+        self._provision_requested: set[str] = set()
         self._tasks: list[asyncio.Task[None]] = []
         self._last_event_ids: OrderedDict[str, str] = OrderedDict()
         self._injection_warnings: set[str] = set()
@@ -705,6 +710,7 @@ class CompanionRuntimePlugin(Star):
         if session:
             if self._routing_is_pending(session):
                 self._request_route_sync()
+                self._request_provision(session)
                 raise RuntimeTransportError(
                     f"routing registry has not answered for session {session!r} yet",
                 )
@@ -722,6 +728,41 @@ class CompanionRuntimePlugin(Star):
             and self._registry_seen
             and not self._route_known(session)
         )
+
+    def _request_provision(self, session: str) -> None:
+        """Ask the fleet for a Runtime for an unknown session, once per session.
+
+        The closed beta's promise is that a tester just talks to the bot; nobody
+        wants to run a command per new person. Bounded on purpose: one request per
+        session per process, and a cap on how many sessions may trigger it, so a
+        stream of strangers cannot make the adapter hammer the fleet.
+        """
+        if self._registry_transport is None or not self._settings.route_auto_provision:
+            return
+        if not session or session in self._provision_requested:
+            return
+        if len(self._provision_requested) >= AUTO_PROVISION_LIMIT:
+            return
+        self._provision_requested.add(session)
+
+        async def once() -> None:
+            try:
+                url = await self._registry_transport.provision_session(
+                    session,
+                    timeout_s=self._settings.request_timeout_s,
+                )
+                if url:
+                    self.logger.info(
+                        "companion_runtime fleet provisioned %s at %s", session, url,
+                    )
+                    await self._sync_registry_once()
+            except Exception:
+                self.logger.debug("companion_runtime provision request failed", exc_info=True)
+
+        try:
+            asyncio.get_running_loop().create_task(once())
+        except RuntimeError:
+            self._provision_requested.discard(session)
 
     def _target_reporter(self, url: str) -> Callable[[ActionReport], Awaitable[None]]:
         """Return a report coroutine bound to one Runtime.
@@ -816,6 +857,7 @@ class CompanionRuntimePlugin(Star):
         """
         if self._routing_is_pending(session):
             self._request_route_sync()
+            self._request_provision(session)
             return ""
         return self._target_url(session)
 

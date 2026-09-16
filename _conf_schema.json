@@ -81,6 +81,12 @@
     "default": 15000,
     "hint": "范围 2000–600000。此外，收到「没有路由覆盖」的会话消息时会额外立刻查一次，所以刚 provision 好的人第一条消息就能走对实例。"
   },
+  "route_auto_provision": {
+    "description": "新人第一次说话时自动为他开一个 Runtime",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，遇到「注册表里没有的会话」时插件会请求 fleet 现场创建一个实例，那个人的第一条消息就落进他自己的实例——封测形态下建议开启（否则每来一个人都要手工 provision，而消息在被路由之前会一直排队等待）。默认关闭，因为「让任何新会话都能让 fleet 长大」属于部署决策。"
+  },
   "report_assistant_messages": {
     "description": "上报机器人实际发出的消息",
     "type": "bool",

@@ -163,6 +163,15 @@ class Settings:
     route_sync_interval_s: float = 15.0
     """How often the adapter re-reads the registry (also refreshed on demand)."""
 
+    route_auto_provision: bool = False
+    """Whether to ask the fleet to create a Runtime for an unknown session.
+
+    Off by default because it lets any new session make the fleet grow, which is a
+    deployment decision rather than an adapter default. A closed beta wants it on: a
+    tester's first message then lands in their own instance instead of waiting in
+    the queue for an operator to provision them.
+    """
+
     @property
     def usable(self) -> bool:
         """Whether the Runtime can be contacted at all."""
@@ -324,4 +333,5 @@ class Settings:
             session_routes=session_routes,
             route_registry_url=registry_url,
             route_sync_interval_s=seconds("route_sync_interval_ms", 15000.0, 2000.0, 600000.0),
+            route_auto_provision=as_bool(data.get("route_auto_provision"), False),
         )
