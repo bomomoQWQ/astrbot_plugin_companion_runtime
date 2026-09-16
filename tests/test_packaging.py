@@ -123,6 +123,18 @@ class ConfigSchemaTests(unittest.TestCase):
         for key, field in self.schema.items():
             self.assertIn(field["type"], supported, f"{key} uses an unsupported type")
             self.assertTrue(field.get("description"), f"{key} has no description")
+            if field["type"] == "object":
+                # AstrBot's parser recurses into ``items`` unconditionally
+                # (``astrbot_config.py::_parse_schema``), so an ``object`` without
+                # one does not degrade -- it makes the whole plugin fail to load
+                # with ``KeyError: 'items'``. A free-form mapping is ``dict``.
+                self.assertIn(
+                    "items",
+                    field,
+                    f"{key} is an object without `items`; AstrBot would fail to load "
+                    "the plugin (use type `dict` for a free-form mapping)",
+                )
+                self.assertIsInstance(field["items"], dict, f"{key}.items must be a schema")
 
     def test_schema_and_settings_agree_on_keys(self) -> None:
         used = set(CONFIG_KEY_PATTERN.findall(self.settings_source))
