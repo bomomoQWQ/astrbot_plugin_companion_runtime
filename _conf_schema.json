@@ -67,7 +67,7 @@
     "description": "上报机器人实际发出的消息",
     "type": "bool",
     "default": true,
-    "hint": "在消息发送后把纯文本回报给 Runtime，作为用户可见的现实记录。不包含 Runtime 的隐藏上下文。"
+    "hint": "把机器人这一轮的答复以纯文本回报给 Runtime，作为用户可见的现实记录。流式输出是 AstrBot 的默认行为，而流式下宿主不会触发任何「发送后」钩子，因此答复取自 LLM 响应（流式下与用户看到的文本一致）；不经过 LLM 的回复（指令输出等）仍按发送后钩子上报，同一轮只上报一次。不包含 Runtime 的隐藏上下文。"
   },
   "inject_enabled": {
     "description": "启用上下文注入",

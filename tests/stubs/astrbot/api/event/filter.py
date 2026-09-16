@@ -91,6 +91,17 @@ def on_llm_request(**kwargs: Any):
     return decorator
 
 
+def on_llm_response(**kwargs: Any):
+    """Stub of ``@filter.on_llm_response``."""
+
+    def decorator(handler):
+        _record("on_llm_response", handler.__name__, handler)
+        return handler
+
+    del kwargs
+    return decorator
+
+
 def after_message_sent(**kwargs: Any):
     """Stub of ``@filter.after_message_sent``."""
 

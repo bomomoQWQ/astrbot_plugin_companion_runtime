@@ -195,7 +195,7 @@ AstrBot/
 | `context_cache_max_sessions` | `64` | 缓存会话数上限（LRU） |
 | `context_prefetch` | `true` | 收到消息即后台预热缓存 |
 | `observe_mode` | `wake` | `wake` / `all`，见下 |
-| `report_assistant_messages` | `true` | 上报机器人实际发出的纯文本 |
+| `report_assistant_messages` | `true` | 上报机器人这一轮的答复（见 §3「为什么用的是 LLM 答复」） |
 | `inject_enabled` | `true` | 关则只上报不注入（注入内容为「背景」，见 §4.2） |
 | `inject_max_chars` | `2000` | 注入文本长度上限，`0` 为不限（截断是插件**唯一**对注入文本的加工） |
 | `outbox_enabled` | `true` | 关则 Runtime 无法主动联系用户 |
@@ -229,6 +229,37 @@ AstrBot/
   流经限流、内容安全等后续管线阶段。这会改变宿主行为，仅在你清楚后果时开启。
 - 无论哪种模式，**只有适配器真正在运行时**这个开关才可能为真：插件被关闭、启动失败（3 次后放弃）
   或已终止时都会把它复位为假，避免用一个已经不存在的适配器去放宽宿主管线（详见 §7）。
+
+### 白名单：被漏掉时插件会「看起来在运行，实际全静默」
+
+AstrBot 的 `plugin_set` 不是「启用列表」，而是**处理器白名单**：`get_handlers_by_event_type()`
+在唤醒检查之前就会把不在名单里的插件的**所有 handler 丢掉**。后果是插件依然被加载、
+`initialize()` 依然执行、outbox 依然在轮询 Runtime（日志里能看到 `adapter started` 和
+`POST /v1/outbox/lease`），但 `on_message_observed` / `on_llm_request` / `on_llm_response`
+**一次都不会被调用** —— 没有任何报错，看起来只是「Runtime 什么都没收到」。
+
+- `plugin_set` 为 `["*"]`（默认）时一切正常。
+- 一旦你在 WebUI 里把它保存成了具体名单，就**必须**把 `astrbot_plugin_companion_runtime`
+  加进去；插件在 `initialize()` 里会自检并打印一条 WARNING 明确指出来。
+- 排障：`docker logs <astrbot 容器> | grep companion_runtime`。若只看到 `adapter started`，
+  却看不到任何 `plugin -> ... - on_message_observed`（需把 AstrBot 日志级别调到 DEBUG），
+  先检查 `plugin_set`。
+
+### report_assistant_messages：为什么上报的是 LLM 的答复，而不是发送回执
+
+「机器人实际发出了什么」在 AstrBot 里**没有可靠的钩子**：
+
+- 默认开启流式输出时，`respond` 阶段走 `send_streaming()` 之后**直接 return**，
+  `after_message_sent` 钩子不会被调用；
+- 同一个流式结果在 `result_decorate` 阶段也会**提前 return**，`on_decorating_result` 同样不触发。
+
+因此插件改从 `on_llm_response` 上报这一轮机器人的答复：该钩子在任何投递模式下都由 agent runner
+**每轮恰好调用一次**，拿到的是模型最终产出的文本 —— 流式下这正是用户看到的那段话。
+`after_message_sent` 仍然保留，用来覆盖「根本没有经过 LLM 的回复」（指令输出、其他插件的结果），
+并且同一轮只上报一次（用事件 extra 标记去重）。
+
+已知代价：若宿主对流式结果另有加工（例如长回复被 t2i 渲染成**图片**），上报的是模型原始文本
+而不是那张图片 —— 对 Runtime 的认知来说，文字比「图片」这两个字更有用。
 
 ### 隐私：什么数据会离开宿主机
 

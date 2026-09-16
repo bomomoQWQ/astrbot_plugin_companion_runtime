@@ -28,7 +28,7 @@ from collections import OrderedDict
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
 from .astrbot_executor import AstrBotActionExecutor
@@ -73,6 +73,14 @@ LAST_EVENT_ID_CACHE = 64
 
 #: How many times a failing start is retried before the adapter gives up quietly.
 MAX_START_ATTEMPTS = 3
+
+#: Event extra that records an assistant turn already reported for this message.
+ASSISTANT_REPORTED_EXTRA = "companion_runtime_assistant_reported"
+
+#: AstrBot's plugin whitelist. A non-wildcard list is applied to every handler
+#: lookup, so a plugin missing from it keeps loading and keeps running its
+#: background workers while none of its hooks ever fire.
+PLUGIN_WHITELIST_KEY = "plugin_set"
 
 #: AstrBot's ``MessageType`` values mapped onto the plain vocabulary the Runtime
 #: protocol documents. The enum's raw values (``FriendMessage`` and friends) are
@@ -166,6 +174,7 @@ class CompanionRuntimePlugin(Star):
     async def initialize(self) -> None:
         """Start background workers (called by AstrBot after loading)."""
         self._start()
+        self._warn_if_whitelisted_out()
 
     async def terminate(self) -> None:
         """Stop background workers and release resources.
@@ -318,6 +327,39 @@ class CompanionRuntimePlugin(Star):
             "on" if outbox is not None else "off",
         )
 
+    def _warn_if_whitelisted_out(self) -> None:
+        """Warn when AstrBot's plugin whitelist leaves this plugin unwired.
+
+        ``star_handlers_registry.get_handlers_by_event_type`` drops every handler
+        of a plugin that is missing from ``plugin_set`` before the waking check
+        runs. An omitted plugin therefore still loads, still logs "adapter
+        started", and still polls the outbox -- while observation, injection and
+        assistant reporting are all silently dead. One warning at startup is the
+        only cheap defence against a failure that otherwise looks like a healthy
+        adapter that happens to see nothing.
+        """
+        name = as_str(getattr(self, "name", ""))
+        if not name:
+            return
+        try:
+            whitelist = self.context.get_config().get(PLUGIN_WHITELIST_KEY)
+        except Exception:
+            return
+        if not isinstance(whitelist, (list, tuple)):
+            return
+        entries = [as_str(entry) for entry in whitelist]
+        if entries == ["*"] or name in entries:
+            return
+        self.logger.warning(
+            "companion_runtime is not in AstrBot's plugin whitelist (plugin_set=%s), "
+            "so AstrBot drops every handler of this plugin before the waking check: "
+            "messages are neither observed nor injected, and no assistant message is "
+            "reported, even though the adapter logs that it started. Add %r to "
+            "plugin_set (AstrBot WebUI -> configuration) or set it to ['*'].",
+            entries,
+            name,
+        )
+
     def _note_start_failure(self, message: str) -> None:
         """Record a failed start, giving up after a few attempts.
 
@@ -395,33 +437,87 @@ class CompanionRuntimePlugin(Star):
         except Exception:
             self.logger.debug("companion_runtime message observation failed", exc_info=True)
 
-    @filter.after_message_sent()
-    async def on_after_message_sent(self, event: AstrMessageEvent) -> None:
-        """Report the message AstrBot actually delivered to the user."""
+    @filter.on_llm_response()
+    async def on_llm_response(
+        self,
+        event: AstrMessageEvent,
+        response: LLMResponse,
+    ) -> None:
+        """Report the assistant turn from the model's own answer.
+
+        AstrBot's ``respond`` stage returns straight after ``send_streaming`` and
+        its ``result_decorate`` stage returns before the pre-send hook when the
+        result is a ``STREAMING_RESULT``, so with streaming on -- AstrBot's
+        default -- neither pre-send nor post-send hook ever fires for a reply.
+        The agent runner calls this hook exactly once per run, in both delivery
+        modes, with the text the model finally produced: under streaming that is
+        the text the user received, and it is a better record for cognition than
+        the rendered chain would be (a long reply is delivered as a rendered
+        *image*, which carries no words).
+
+        The turn is marked so ``after_message_sent`` cannot report it twice on a
+        host that does run that hook.
+        """
         try:
-            self._start()
-            if self._queue is None or not self._settings.report_assistant_messages:
-                return
-            text = self._result_text(event)
-            if not text:
-                return
-            session = event.unified_msg_origin
-            record = EventRecord(
-                kind=EVENT_ASSISTANT_MESSAGE,
-                session=session,
-                text=text,
-                platform=as_str(event.get_platform_name()),
-                message_type=_message_type_name(event),
-                sender_id=as_str(event.get_self_id()),
-                sender_name="bot",
-                self_id=as_str(event.get_self_id()),
-                group_id=as_str(event.get_group_id()),
-                wake=bool(getattr(event, "is_at_or_wake_command", False)),
-            )
-            self._remember_event_id(session, record.event_id)
-            self._enqueue_event(record)
+            text = as_str(getattr(response, "completion_text", "")).strip()
+            if text and self._report_assistant(event, text):
+                self._mark_assistant_reported(event)
         except Exception:
             self.logger.debug("companion_runtime assistant report failed", exc_info=True)
+
+    @filter.after_message_sent()
+    async def on_after_message_sent(self, event: AstrMessageEvent) -> None:
+        """Report the message AstrBot actually delivered to the user.
+
+        This covers what the LLM-response hook cannot see: a reply that never
+        went through the agent at all, such as a command's output or another
+        plugin's result. Once a turn has an LLM response, that response is the
+        report, so the delivered chain is not reported a second time.
+        """
+        try:
+            if self._assistant_reported(event):
+                return
+            text = self._result_text(event)
+            if text:
+                self._report_assistant(event, text)
+        except Exception:
+            self.logger.debug("companion_runtime assistant report failed", exc_info=True)
+
+    def _report_assistant(self, event: AstrMessageEvent, text: str) -> bool:
+        """Queue one assistant message; return whether it was queued."""
+        self._start()
+        if self._queue is None or not self._settings.report_assistant_messages:
+            return False
+        session = event.unified_msg_origin
+        record = EventRecord(
+            kind=EVENT_ASSISTANT_MESSAGE,
+            session=session,
+            text=text,
+            platform=as_str(event.get_platform_name()),
+            message_type=_message_type_name(event),
+            sender_id=as_str(event.get_self_id()),
+            sender_name="bot",
+            self_id=as_str(event.get_self_id()),
+            group_id=as_str(event.get_group_id()),
+            wake=bool(getattr(event, "is_at_or_wake_command", False)),
+        )
+        self._remember_event_id(session, record.event_id)
+        self._enqueue_event(record)
+        return True
+
+    def _assistant_reported(self, event: AstrMessageEvent) -> bool:
+        """Return whether this turn's assistant message is already reported."""
+        try:
+            return bool(event.get_extra(ASSISTANT_REPORTED_EXTRA, False))
+        except Exception:
+            return False
+
+    def _mark_assistant_reported(self, event: AstrMessageEvent) -> None:
+        """Remember that this turn's assistant message is already reported."""
+        try:
+            event.set_extra(ASSISTANT_REPORTED_EXTRA, True)
+        except Exception:
+            self.logger.debug("companion_runtime could not mark the reported turn")
 
     # ------------------------------------------------------------------
     # context injection

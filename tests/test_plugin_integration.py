@@ -72,6 +72,15 @@ class StubMessageEvent:
         #: AstrBot's real enum values ("FriendMessage", "GroupMessage", ...), not
         #: the plain scope words the Runtime protocol uses.
         self._message_type = message_type
+        self._extras: dict[str, Any] = {}
+
+    def set_extra(self, key: str, value: Any) -> None:
+        self._extras[key] = value
+
+    def get_extra(self, key: str | None = None, default: Any = None) -> Any:
+        if key is None:
+            return self._extras
+        return self._extras.get(key, default)
 
     def get_platform_name(self) -> str:
         return "webchat"
@@ -116,15 +125,23 @@ class StubContext:
         provider_id: str = "openai/gpt-4o",
         completion: str = "主动消息",
         send_delay_s: float = 0.0,
+        plugin_whitelist: Any = None,
     ) -> None:
         self.provider_id = provider_id
         self.completion = completion
         #: Lets a test hold a delivery in flight while it terminates the plugin.
         self.send_delay_s = send_delay_s
+        self.plugin_whitelist = plugin_whitelist
         self.sent: list[tuple[str, Any]] = []
         self.generated: list[dict[str, Any]] = []
         self.provider_lookups: list[str] = []
         self.send_started = asyncio.Event()
+
+    def get_config(self) -> dict[str, Any]:
+        """Mirror ``Context.get_config()`` for the whitelist self-check."""
+        if self.plugin_whitelist is None:
+            return {}
+        return {"plugin_set": self.plugin_whitelist}
 
     async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
         self.provider_lookups.append(str(umo))
@@ -353,6 +370,76 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         record = transport.event_bodies[0]["events"][0]
         self.assertEqual(record["kind"], "assistant_message")
         self.assertEqual(record["text"], "我在听")
+
+    async def test_streamed_turn_is_reported_from_the_llm_response(self) -> None:
+        """With streaming on, neither pre-send nor post-send hook ever fires."""
+        from astrbot.api.provider import LLMResponse
+
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        event = StubMessageEvent()
+
+        await self._handler("on_llm_response")(
+            self.plugin,
+            event,
+            LLMResponse("我听见了，慢慢说"),
+        )
+
+        self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
+        record = transport.event_bodies[0]["events"][0]
+        self.assertEqual(record["kind"], "assistant_message")
+        self.assertEqual(record["text"], "我听见了，慢慢说")
+        self.assertEqual(record["session"], SESSION)
+
+    async def test_a_reported_turn_is_not_reported_twice(self) -> None:
+        """A host that streams *and* runs the delivery hook must still send one."""
+        from astrbot.api.provider import LLMResponse
+
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        event = StubMessageEvent(result_text="我听见了，慢慢说")
+
+        await self._handler("on_llm_response")(self.plugin, event, LLMResponse("我听见了，慢慢说"))
+        await self._handler("on_after_message_sent")(self.plugin, event)
+
+        self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
+        self.assertEqual(len(transport.event_bodies), 1)
+        self.assertEqual(transport.event_bodies[0]["events"][0]["text"], "我听见了，慢慢说")
+
+    async def test_a_reply_without_an_llm_turn_is_still_reported(self) -> None:
+        """A command's output never reaches the LLM-response hook."""
+        from astrbot.api.provider import LLMResponse
+
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+
+        empty = StubMessageEvent(result_text="companion Runtime adapter\n- state: running")
+        await self._handler("on_llm_response")(self.plugin, empty, LLMResponse(""))
+        await self._handler("on_after_message_sent")(self.plugin, empty)
+
+        self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
+        record = transport.event_bodies[0]["events"][0]
+        self.assertEqual(record["kind"], "assistant_message")
+        self.assertIn("companion Runtime adapter", record["text"])
+
+    async def test_an_unwhitelisted_plugin_warns_at_startup(self) -> None:
+        """A whitelist that omits this plugin kills every hook, silently."""
+        self.context = StubContext(plugin_whitelist=["some_other_plugin"])
+        plugin = await self._plugin()
+        plugin.name = "astrbot_plugin_companion_runtime"
+
+        with self.assertLogs("astrbot.plugin.stub", level="WARNING") as captured:
+            await plugin.initialize()
+
+        self.assertIn("plugin whitelist", "\n".join(captured.output))
+
+    async def test_a_whitelisted_plugin_stays_quiet(self) -> None:
+        self.context = StubContext(plugin_whitelist=["*"])
+        plugin = await self._plugin()
+        plugin.name = "astrbot_plugin_companion_runtime"
+
+        with self.assertNoLogs("astrbot.plugin.stub", level="WARNING"):
+            await plugin.initialize()
 
     async def test_disabled_plugin_does_nothing(self) -> None:
         plugin = await self._plugin(enabled=False)
