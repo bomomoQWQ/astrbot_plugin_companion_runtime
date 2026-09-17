@@ -425,11 +425,16 @@ class CompanionRuntimePlugin(Star):
 
         self.logger.info(
             "companion_runtime adapter started (adapter_id=%s, base_url=%s, "
-            "observe_mode=%s, outbox=%s, targets=%s, registry=%s)",
+            "observe_mode=%s, outbox=%s, debounce=%s, targets=%s, registry=%s)",
             self._settings.adapter_id,
             self._settings.base_url,
             self._settings.observe_mode,
             "on" if consumers else "off",
+            # Logged because a debounce that silently did not load looks exactly
+            # like a debounce that loaded and is working: both are quiet.
+            "%dms" % int(self._settings.input_debounce_s * 1000.0)
+            if self._settings.input_debounce_s > 0.0
+            else "off",
             ", ".join(self._settings.targets),
             self._settings.route_registry_url or "off",
         )
