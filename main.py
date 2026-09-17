@@ -159,6 +159,22 @@ class _RuntimeTarget:
     url: str = ""
 
 
+@dataclass
+class _InputBurst:
+    """One session's in-flight burst of consecutive user messages.
+
+    Every request of the burst appends its own text and then races to be the
+    last one standing: the handler whose ``generation`` is still current after
+    the quiet window elapses answers with the merged text, and every earlier
+    handler yields with ``event.stop_event()``. Nothing is cancelled explicitly
+    -- an older handler always wakes up and sees that a newer message took over.
+    """
+
+    parts: list[str] = field(default_factory=list)
+    generation: int = 0
+    deadline: float = 0.0
+
+
 class CompanionRuntimePlugin(Star):
     """Host-side thin adapter for the companion Runtime."""
 
@@ -200,6 +216,9 @@ class CompanionRuntimePlugin(Star):
         self._tasks: list[asyncio.Task[None]] = []
         self._last_event_ids: OrderedDict[str, str] = OrderedDict()
         self._injection_warnings: set[str] = set()
+        #: Session -> the burst of consecutive messages currently being merged.
+        #: Entries live only while a request waits out ``input_debounce_ms``.
+        self._input_bursts: dict[str, _InputBurst] = {}
         # Take ownership of the shared scope filter straight away: a previous
         # instance may have left it widened, and AstrBot only reloads plugin
         # instances, it never resets module level state for them.
@@ -621,6 +640,95 @@ class CompanionRuntimePlugin(Star):
             event.set_extra(ASSISTANT_REPORTED_EXTRA, True)
         except Exception:
             self.logger.debug("companion_runtime could not mark the reported turn")
+
+    # ------------------------------------------------------------------
+    # input debounce
+    # ------------------------------------------------------------------
+
+    @filter.on_llm_request(priority=100)
+    async def on_llm_request_debounce(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """Answer only the last message of a burst (``input_debounce_ms``).
+
+        Runs ahead of :meth:`on_llm_request`, so a superseded request is stopped
+        before the Runtime is asked for a context block it will never use.
+
+        The earlier messages are merged into ``req.prompt`` rather than dropped.
+        An AstrBot conversation is persisted as a user/assistant *pair* once the
+        LLM has answered, so a request stopped here never reaches history:
+        cancelling the earlier events without merging their text would silently
+        remove those words from the model's view even though the Runtime did
+        observe them.
+        """
+        window = self._settings.input_debounce_s
+        if window <= 0.0:
+            return
+        try:
+            superseded = await self._coalesce_burst(event, req, window)
+        except Exception:
+            self.logger.debug("companion_runtime input debounce failed", exc_info=True)
+            return
+        if superseded:
+            event.stop_event()
+
+    async def _coalesce_burst(
+        self, event: AstrMessageEvent, req: ProviderRequest, window: float
+    ) -> bool:
+        """Wait out the quiet window and report whether a newer message won.
+
+        Args:
+            event: The event being processed.
+            req: The provider request whose prompt carries this message.
+            window: Quiet period in seconds.
+
+        Returns:
+            ``True`` when a later message of the same session superseded this one.
+        """
+        key = as_str(event.unified_msg_origin)
+        now = asyncio.get_running_loop().time()
+        burst = self._input_bursts.get(key)
+        if burst is None:
+            self._prune_bursts(now)
+            burst = _InputBurst()
+            self._input_bursts[key] = burst
+
+        burst.generation += 1
+        generation = burst.generation
+        burst.deadline = now + window
+        text = as_str(getattr(req, "prompt", "")).strip()
+        if text:
+            burst.parts.append(text)
+            limit = self._settings.input_debounce_max_chars
+            if limit > 0:
+                # Keep the newest parts: the oldest is the cheapest to drop and
+                # the tail is what the user is still waiting on.
+                while len(burst.parts) > 1 and sum(len(part) for part in burst.parts) > limit:
+                    burst.parts.pop(0)
+
+        while True:
+            remaining = burst.deadline - asyncio.get_running_loop().time()
+            if remaining > 0.0:
+                await asyncio.sleep(remaining)
+            if burst.generation == generation:
+                break
+            return True
+
+        merged = "\n".join(burst.parts).strip()
+        self._input_bursts.pop(key, None)
+        if merged:
+            req.prompt = merged
+        return False
+
+    def _prune_bursts(self, now: float) -> None:
+        """Drop bursts whose window closed long ago.
+
+        The last handler of a burst normally removes its own entry; this covers
+        the one that never resumed, for instance on shutdown.
+        """
+        stale = [key for key, burst in self._input_bursts.items() if burst.deadline < now - 60.0]
+        for key in stale:
+            self._input_bursts.pop(key, None)
 
     # ------------------------------------------------------------------
     # context injection

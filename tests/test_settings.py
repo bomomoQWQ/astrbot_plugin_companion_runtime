@@ -35,6 +35,12 @@ class SettingsDefaultsTests(unittest.TestCase):
         self.assertFalse(settings.enabled)
         self.assertFalse(settings.usable)
 
+    def test_input_debounce_is_off_until_configured(self) -> None:
+        """An upgrade must not start delaying replies on its own."""
+        settings = Settings.from_mapping(None)
+        self.assertEqual(settings.input_debounce_s, 0.0)
+        self.assertEqual(settings.input_debounce_max_chars, 4000)
+
 
 class SettingsCoercionTests(unittest.TestCase):
     def test_webui_string_values_are_coerced(self) -> None:
@@ -88,6 +94,20 @@ class SettingsClampTests(unittest.TestCase):
             settings.queue_max_backoff_s,
             settings.queue_base_backoff_s,
         )
+
+    def test_input_debounce_window_is_clamped(self) -> None:
+        """A runaway window would hold every reply for minutes."""
+        settings = Settings.from_mapping({"input_debounce_ms": 600000})
+        self.assertAlmostEqual(settings.input_debounce_s, 30.0)
+        self.assertTrue(any("input_debounce_ms" in issue for issue in settings.issues))
+
+    def test_negative_input_debounce_is_off(self) -> None:
+        settings = Settings.from_mapping({"input_debounce_ms": -500})
+        self.assertEqual(settings.input_debounce_s, 0.0)
+
+    def test_input_debounce_window_is_read_in_milliseconds(self) -> None:
+        settings = Settings.from_mapping({"input_debounce_ms": 2500})
+        self.assertAlmostEqual(settings.input_debounce_s, 2.5)
 
 
 class SettingsValidationTests(unittest.TestCase):

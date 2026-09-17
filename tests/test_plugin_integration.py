@@ -69,6 +69,9 @@ class StubMessageEvent:
         self.message_obj = SimpleNamespace(message_id="msg-1")
         self.is_at_or_wake_command = wake
         self._result_text = result_text
+        #: Set when a handler stops this event, so a test can tell a superseded
+        #: request from the one that actually gets answered.
+        self.stopped = False
         #: AstrBot's real enum values ("FriendMessage", "GroupMessage", ...), not
         #: the plain scope words the Runtime protocol uses.
         self._message_type = message_type
@@ -76,6 +79,9 @@ class StubMessageEvent:
 
     def set_extra(self, key: str, value: Any) -> None:
         self._extras[key] = value
+
+    def stop_event(self) -> None:
+        self.stopped = True
 
     def get_extra(self, key: str | None = None, default: Any = None) -> Any:
         if key is None:
@@ -720,6 +726,78 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         request = SimpleNamespace(extra_user_content_parts=[])
         await self._handler("on_llm_request")(plugin, StubMessageEvent(), request)
         self.assertEqual(request.extra_user_content_parts, [])
+
+    # -- input debounce ----------------------------------------------------
+
+    async def test_debounce_is_off_by_default(self) -> None:
+        await self._plugin()
+
+        from astrbot.api.provider import ProviderRequest
+
+        event = StubMessageEvent(text="在吗")
+        request = ProviderRequest(prompt="在吗")
+        await self._handler("on_llm_request_debounce")(self.plugin, event, request)
+
+        self.assertEqual(request.prompt, "在吗")
+        self.assertFalse(event.stopped)
+        self.assertEqual(self.plugin._input_bursts, {})
+
+    async def test_a_burst_of_messages_is_answered_once(self) -> None:
+        await self._plugin(input_debounce_ms=60)
+
+        from astrbot.api.provider import ProviderRequest
+
+        texts = ("在吗", "睡了没", "?")
+        events = [StubMessageEvent(text=text) for text in texts]
+        requests = [ProviderRequest(prompt=text) for text in texts]
+        handler = self._handler("on_llm_request_debounce")
+
+        async def fire(index: int) -> None:
+            # Stagger the arrivals so the burst is unambiguous regardless of how
+            # the event loop schedules the tasks.
+            await asyncio.sleep(index * 0.01)
+            await handler(self.plugin, events[index], requests[index])
+
+        await asyncio.gather(*(fire(index) for index in range(len(texts))))
+
+        self.assertEqual(requests[-1].prompt, "在吗\n睡了没\n?")
+        self.assertFalse(events[-1].stopped, "the newest message must be answered")
+        self.assertTrue(events[0].stopped, "a superseded message must not be answered")
+        self.assertTrue(events[1].stopped)
+        self.assertEqual(self.plugin._input_bursts, {}, "a settled burst must not leak")
+
+    async def test_only_the_newest_parts_survive_the_char_limit(self) -> None:
+        await self._plugin(input_debounce_ms=60, input_debounce_max_chars=10)
+
+        from astrbot.api.provider import ProviderRequest
+
+        events = [StubMessageEvent(text=text) for text in ("0123456789", "abc")]
+        requests = [ProviderRequest(prompt=text) for text in ("0123456789", "abc")]
+        handler = self._handler("on_llm_request_debounce")
+
+        async def fire(index: int) -> None:
+            await asyncio.sleep(index * 0.01)
+            await handler(self.plugin, events[index], requests[index])
+
+        await asyncio.gather(*(fire(index) for index in range(len(events))))
+
+        # 13 chars would exceed the 10-char budget, so the oldest message goes.
+        self.assertEqual(requests[-1].prompt, "abc")
+
+    async def test_a_second_burst_after_the_window_is_a_new_turn(self) -> None:
+        await self._plugin(input_debounce_ms=30)
+
+        from astrbot.api.provider import ProviderRequest
+
+        handler = self._handler("on_llm_request_debounce")
+        first_request = ProviderRequest(prompt="第一句")
+        second_request = ProviderRequest(prompt="第二句")
+
+        await handler(self.plugin, StubMessageEvent(text="第一句"), first_request)
+        await handler(self.plugin, StubMessageEvent(text="第二句"), second_request)
+
+        self.assertEqual(first_request.prompt, "第一句")
+        self.assertEqual(second_request.prompt, "第二句")
 
     # -- injection ---------------------------------------------------------
 

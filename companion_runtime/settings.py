@@ -118,6 +118,19 @@ class Settings:
     inject_enabled: bool = True
     inject_max_chars: int = 2000
 
+    input_debounce_s: float = 0.0
+    """Coalesce a burst of consecutive user messages into one LLM turn.
+
+    ``0`` disables it. With a window set, a request waits at most that long for
+    more messages from the same session and only the last one is answered, so
+    "在吗" / "睡了没" / "?" sent back to back produce one reply instead of three.
+    The Runtime still observes every message: observation happens when a message
+    arrives (see :meth:`CompanionRuntimePlugin.on_message_observed`), not at the
+    LLM stage, so a burst stays several raw events.
+    """
+    input_debounce_max_chars: int = 4000
+    """Upper bound on the merged burst; the newest messages win."""
+
     outbox_enabled: bool = True
     outbox_poll_interval_s: float = 1.0
     outbox_batch: int = 2
@@ -315,6 +328,8 @@ class Settings:
             report_assistant_messages=as_bool(data.get("report_assistant_messages"), True),
             inject_enabled=as_bool(data.get("inject_enabled"), True),
             inject_max_chars=count("inject_max_chars", 2000, 0, 100000),
+            input_debounce_s=seconds("input_debounce_ms", 0.0, 0.0, 30000.0),
+            input_debounce_max_chars=count("input_debounce_max_chars", 4000, 0, 100000),
             outbox_enabled=as_bool(data.get("outbox_enabled"), True),
             outbox_poll_interval_s=seconds("outbox_poll_interval_ms", 1000.0, 200.0, 60000.0),
             outbox_batch=count("outbox_max_actions_per_poll", 2, 1, 16),
