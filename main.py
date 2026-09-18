@@ -143,6 +143,27 @@ def _message_type_name(event: AstrMessageEvent) -> str:
     return MESSAGE_TYPE_NAMES.get(raw, raw)
 
 
+def _event_is_stopped(event: AstrMessageEvent) -> bool:
+    """Return whether another handler already stopped this event.
+
+    AstrBot's ``AstrMessageEvent.is_stopped()`` is the documented check, but the
+    adapter tolerates hosts that expose only the ``stopped`` attribute.
+
+    Args:
+        event: The AstrBot event about to be reported.
+
+    Returns:
+        ``True`` when the event must not be treated as a user turn.
+    """
+    checker = getattr(event, "is_stopped", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    return bool(getattr(event, "stopped", False))
+
+
 @dataclass
 class _RuntimeTarget:
     """One Runtime this adapter talks to.
@@ -504,7 +525,16 @@ class CompanionRuntimePlugin(Star):
     # observation
     # ------------------------------------------------------------------
 
-    @filter.custom_filter(_ObservationScopeFilter)
+    # AstrBot dispatches plugin handlers in *descending* priority and breaks the whole
+    # chain once an event is stopped (``pipeline/process_stage/method/star_request.py``
+    # checks ``event.is_stopped()`` before every handler). Running the observation at a
+    # negative priority therefore means "another plugin already decided this message is
+    # not a turn" is respected rather than fought: a word filter that drops a message
+    # must also keep it out of the Runtime. Measured on a real QQ: a tester set their
+    # client's auto-reply to 「。」, so every message the character sent came back as
+    # ``[自动回复] 。``, each one was reported to the Runtime as a user turn, and she
+    # answered ~1300 of them in a single morning.
+    @filter.custom_filter(_ObservationScopeFilter, priority=-100)
     async def on_message_observed(self, event: AstrMessageEvent) -> None:
         """Report an observed user message to the Runtime.
 
@@ -513,6 +543,11 @@ class CompanionRuntimePlugin(Star):
         handles the message.
         """
         try:
+            if _event_is_stopped(event):
+                # Defence in depth: the low priority above already keeps the handler out
+                # of the chain once something stopped the event, and this keeps the
+                # guarantee true even if the host ever dispatches differently.
+                return
             self._start()
             queue = self._queue
             if queue is None:

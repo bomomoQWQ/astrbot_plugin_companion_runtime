@@ -83,6 +83,10 @@ class StubMessageEvent:
     def stop_event(self) -> None:
         self.stopped = True
 
+    def is_stopped(self) -> bool:
+        """Mirror ``AstrMessageEvent.is_stopped``."""
+        return self.stopped
+
     def get_extra(self, key: str | None = None, default: Any = None) -> Any:
         if key is None:
             return self._extras
@@ -256,6 +260,26 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["session"], SESSION)
         self.assertEqual(record["platform"], "webchat")
         self.assertTrue(record["preempts_proactive"])
+
+    async def test_a_message_another_plugin_dropped_is_not_reported(self) -> None:
+        """A stopped event never becomes a user turn in the Runtime.
+
+        AstrBot breaks the plugin handler chain once an event is stopped, and the
+        observation handler runs at a deliberately low priority so a filter plugin can
+        drop a message first. The guard is also checked inside the handler, which is
+        what this test pins. Measured on a real QQ: the tester's client auto-reply was
+        「。」, so every message she sent came back as ``[自动回复] 。``, each one was
+        filed as a user message, and she answered roughly 1300 of them in one morning.
+        """
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+
+        event = StubMessageEvent(text="[自动回复] 。")
+        event.stop_event()
+        await self._handler("on_message_observed")(self.plugin, event)
+
+        self.assertEqual(transport.event_bodies, [])
+        self.assertEqual(len(self.plugin._queue), 0)
 
     async def test_non_wake_message_is_not_reported_in_wake_mode(self) -> None:
         await self._plugin()
