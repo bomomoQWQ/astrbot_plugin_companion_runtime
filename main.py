@@ -685,41 +685,42 @@ class CompanionRuntimePlugin(Star):
     # input debounce
     # ------------------------------------------------------------------
 
-    @filter.on_llm_request(priority=100)
-    async def on_llm_request_debounce(
-        self, event: AstrMessageEvent, req: ProviderRequest
-    ) -> None:
+    @filter.on_waiting_llm_request(priority=100)
+    async def on_waiting_llm_request(self, event: AstrMessageEvent) -> None:
         """Answer only the last message of a burst (``input_debounce_ms``).
 
-        Runs ahead of :meth:`on_llm_request`, so a superseded request is stopped
-        before the Runtime is asked for a context block it will never use.
+        This hook exists so the wait can happen *before* AstrBot takes its per-session
+        lock: ``internal.py`` calls ``OnWaitingLLMRequestEvent`` and only then enters
+        ``session_lock_manager.acquire_lock``, and ``on_llm_request`` runs inside that
+        lock. Waiting there could therefore never work — the next message of a burst
+        cannot reach its own handler until this turn has finished, so the wait always
+        times out and answers anyway. Measured on a real beta: two messages two seconds
+        apart produced two answers in a row.
 
-        The earlier messages are merged into ``req.prompt`` rather than dropped.
-        An AstrBot conversation is persisted as a user/assistant *pair* once the
-        LLM has answered, so a request stopped here never reaches history:
-        cancelling the earlier events without merging their text would silently
-        remove those words from the model's view even though the Runtime did
-        observe them.
+        The superseded events are stopped; their text is merged into the surviving
+        event's ``message_str`` (AstrBot builds ``req.prompt`` from it in
+        ``collect_initial_request``) rather than dropped. An AstrBot conversation is
+        persisted as a user/assistant *pair* once the LLM has answered, so a request
+        stopped here never reaches history: cancelling the earlier events without
+        merging their text would silently remove those words from the model's view even
+        though the Runtime did observe them.
         """
         window = self._settings.input_debounce_s
         if window <= 0.0:
             return
         try:
-            superseded = await self._coalesce_burst(event, req, window)
+            superseded = await self._coalesce_burst(event, window)
         except Exception:
             self.logger.debug("companion_runtime input debounce failed", exc_info=True)
             return
         if superseded:
             event.stop_event()
 
-    async def _coalesce_burst(
-        self, event: AstrMessageEvent, req: ProviderRequest, window: float
-    ) -> bool:
+    async def _coalesce_burst(self, event: AstrMessageEvent, window: float) -> bool:
         """Wait out the quiet window and report whether a newer message won.
 
         Args:
             event: The event being processed.
-            req: The provider request whose prompt carries this message.
             window: Quiet period in seconds.
 
         Returns:
@@ -736,7 +737,7 @@ class CompanionRuntimePlugin(Star):
         burst.generation += 1
         generation = burst.generation
         burst.deadline = now + window
-        text = as_str(getattr(req, "prompt", "")).strip()
+        text = as_str(getattr(event, "message_str", "")).strip()
         if text:
             burst.parts.append(text)
             limit = self._settings.input_debounce_max_chars
@@ -757,7 +758,7 @@ class CompanionRuntimePlugin(Star):
         merged = "\n".join(burst.parts).strip()
         self._input_bursts.pop(key, None)
         if merged:
-            req.prompt = merged
+            event.message_str = merged
         return False
 
     def _prune_bursts(self, now: float) -> None:

@@ -756,35 +756,58 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_debounce_is_off_by_default(self) -> None:
         await self._plugin()
 
-        from astrbot.api.provider import ProviderRequest
-
         event = StubMessageEvent(text="在吗")
-        request = ProviderRequest(prompt="在吗")
-        await self._handler("on_llm_request_debounce")(self.plugin, event, request)
+        await self._handler("on_waiting_llm_request")(self.plugin, event)
 
-        self.assertEqual(request.prompt, "在吗")
+        self.assertEqual(event.message_str, "在吗")
         self.assertFalse(event.stopped)
         self.assertEqual(self.plugin._input_bursts, {})
+
+    async def test_the_debounce_is_registered_before_the_session_lock(self) -> None:
+        """It must sit on the waiting hook, not on ``on_llm_request``.
+
+        AstrBot calls ``OnWaitingLLMRequestEvent`` first and only then takes the
+        per-session lock; ``on_llm_request`` runs inside that lock. A debounce waiting
+        inside the lock can never observe the next message of the burst, because that
+        message's handler cannot start until this turn has finished - which is exactly
+        the failure measured in the beta (two messages two seconds apart, two answers).
+        """
+        await self._plugin(input_debounce_ms=60)
+
+        self.assertEqual(
+            self.filters.registration_for("on_waiting_llm_request").kind,
+            "on_waiting_llm_request",
+        )
+        self.assertFalse(
+            any(
+                registration.name == "on_waiting_llm_request"
+                and registration.kind == "on_llm_request"
+                for registration in self.filters.REGISTRATIONS
+            )
+            or any(
+                registration.kind == "on_llm_request"
+                and registration.name.endswith("debounce")
+                for registration in self.filters.REGISTRATIONS
+            ),
+            "the debounce must not be registered on on_llm_request",
+        )
 
     async def test_a_burst_of_messages_is_answered_once(self) -> None:
         await self._plugin(input_debounce_ms=60)
 
-        from astrbot.api.provider import ProviderRequest
-
         texts = ("在吗", "睡了没", "?")
         events = [StubMessageEvent(text=text) for text in texts]
-        requests = [ProviderRequest(prompt=text) for text in texts]
-        handler = self._handler("on_llm_request_debounce")
+        handler = self._handler("on_waiting_llm_request")
 
         async def fire(index: int) -> None:
             # Stagger the arrivals so the burst is unambiguous regardless of how
             # the event loop schedules the tasks.
             await asyncio.sleep(index * 0.01)
-            await handler(self.plugin, events[index], requests[index])
+            await handler(self.plugin, events[index])
 
         await asyncio.gather(*(fire(index) for index in range(len(texts))))
 
-        self.assertEqual(requests[-1].prompt, "在吗\n睡了没\n?")
+        self.assertEqual(events[-1].message_str, "在吗\n睡了没\n?")
         self.assertFalse(events[-1].stopped, "the newest message must be answered")
         self.assertTrue(events[0].stopped, "a superseded message must not be answered")
         self.assertTrue(events[1].stopped)
@@ -793,35 +816,30 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_only_the_newest_parts_survive_the_char_limit(self) -> None:
         await self._plugin(input_debounce_ms=60, input_debounce_max_chars=10)
 
-        from astrbot.api.provider import ProviderRequest
-
         events = [StubMessageEvent(text=text) for text in ("0123456789", "abc")]
-        requests = [ProviderRequest(prompt=text) for text in ("0123456789", "abc")]
-        handler = self._handler("on_llm_request_debounce")
+        handler = self._handler("on_waiting_llm_request")
 
         async def fire(index: int) -> None:
             await asyncio.sleep(index * 0.01)
-            await handler(self.plugin, events[index], requests[index])
+            await handler(self.plugin, events[index])
 
         await asyncio.gather(*(fire(index) for index in range(len(events))))
 
         # 13 chars would exceed the 10-char budget, so the oldest message goes.
-        self.assertEqual(requests[-1].prompt, "abc")
+        self.assertEqual(events[-1].message_str, "abc")
 
     async def test_a_second_burst_after_the_window_is_a_new_turn(self) -> None:
         await self._plugin(input_debounce_ms=30)
 
-        from astrbot.api.provider import ProviderRequest
+        handler = self._handler("on_waiting_llm_request")
+        first = StubMessageEvent(text="第一句")
+        second = StubMessageEvent(text="第二句")
 
-        handler = self._handler("on_llm_request_debounce")
-        first_request = ProviderRequest(prompt="第一句")
-        second_request = ProviderRequest(prompt="第二句")
+        await handler(self.plugin, first)
+        await handler(self.plugin, second)
 
-        await handler(self.plugin, StubMessageEvent(text="第一句"), first_request)
-        await handler(self.plugin, StubMessageEvent(text="第二句"), second_request)
-
-        self.assertEqual(first_request.prompt, "第一句")
-        self.assertEqual(second_request.prompt, "第二句")
+        self.assertEqual(first.message_str, "第一句")
+        self.assertEqual(second.message_str, "第二句")
 
     # -- injection ---------------------------------------------------------
 

@@ -91,6 +91,23 @@ def on_llm_request(**kwargs: Any):
     return decorator
 
 
+def on_waiting_llm_request(**kwargs: Any):
+    """Stub of ``@filter.on_waiting_llm_request``.
+
+    AstrBot fires this *before* it takes the per-session lock (its docstring says so:
+    "在获取锁之前"), and inside the lock the next message of a burst cannot reach its own
+    handler - which is why the input debounce has to live here rather than in
+    ``on_llm_request``. ``test_plugin_integration`` pins that placement.
+    """
+
+    def decorator(handler):
+        _record("on_waiting_llm_request", handler.__name__, handler)
+        return handler
+
+    del kwargs
+    return decorator
+
+
 def on_llm_response(**kwargs: Any):
     """Stub of ``@filter.on_llm_response``."""
 
