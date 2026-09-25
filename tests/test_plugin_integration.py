@@ -1049,6 +1049,7 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("状态", content.text)
         self.assertIn("定时任务叫醒的", content.text)
         self.assertIn("一条一次", content.text)
+        self.assertIn("不要换行", content.text)
 
     async def test_a_run_that_already_has_the_block_is_left_alone(self) -> None:
         """The pipeline injected this run; a second copy would only repeat it."""

@@ -114,11 +114,18 @@ HOST_DELIVERY_NOTE = (
 #: The same, for a run a cron job woke. There the completion text is not delivered at all -
 #: the job path says so itself ("agent will send message to user via using tools") - so the
 #: rule inverts: the tool is the only way out, and one bubble means one tool call.
+#:
+#: The no-newline rule is the second half of it, learned the same way: with only "one call per
+#: line" stated, she did call the tool once per paragraph but each call still carried its own
+#: ``\n`` (measured 2026-09-25 22:20: 「博馍馍，我来跟你说晚安了。\n先说正事 —— …」), and inside one
+#: QQ bubble a newline just breaks the line in half. A chat turn is different: there the host's
+#: splitter cuts on ``\n``, so newlines are how she gets her bubbles.
 HOST_DELIVERY_NOTE_CRON = (
     "（宿主说明，不是她脑子里的事）\n"
     "- 这一轮是定时任务叫醒的：正文不会发给用户，要对他说的话必须用 send_message_to_user 发。\n"
-    "- 一条一次：要说三句就调用三次，每次 messages 里只放一条。那个工具一次调用在 QQ 里只算一条气泡，"
-    "几行塞进一条会挤成一坨。\n"
+    "- 一条一次：要说三句就调用三次，每次 messages 里只放一条。\n"
+    "- 每条**不要换行**：一次调用在 QQ 里就是一条气泡，条里再换行就会在气泡中间断开；"
+    "想说几段就多调几次，每次一小段。\n"
     "- 不要写「我做了什么」的汇报或总结，把要对他说的话本身发出去。"
 )
 
