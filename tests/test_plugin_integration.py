@@ -63,6 +63,7 @@ class StubMessageEvent:
         wake: bool = True,
         result_text: str = "",
         message_type: str = "FriendMessage",
+        platform: str = "webchat",
     ) -> None:
         self.unified_msg_origin = session
         self.message_str = text
@@ -75,6 +76,9 @@ class StubMessageEvent:
         #: AstrBot's real enum values ("FriendMessage", "GroupMessage", ...), not
         #: the plain scope words the Runtime protocol uses.
         self._message_type = message_type
+        #: A cron run arrives as its own platform ("cron"), which changes the rules for
+        #: delivering what the character says.
+        self._platform = platform
         self._extras: dict[str, Any] = {}
 
     def set_extra(self, key: str, value: Any) -> None:
@@ -93,7 +97,7 @@ class StubMessageEvent:
         return self._extras.get(key, default)
 
     def get_platform_name(self) -> str:
-        return "webchat"
+        return self._platform if hasattr(self, "_platform") else "webchat"
 
     def get_message_type(self) -> Any:
         return SimpleNamespace(value=self._message_type)
@@ -999,6 +1003,67 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self._handler("on_llm_request")(self.plugin, StubMessageEvent(), request)
 
         self.assertEqual(request.extra_user_content_parts, [])
+
+    async def test_the_injection_carries_the_host_delivery_note(self) -> None:
+        """Plain text goes out as the reply, not through the send tool.
+
+        ``result_decorate`` is what splits her reply into bubbles, and a message sent
+        through ``send_message_to_user`` never passes through it: measured on the beta
+        (2026-09-25 21:45) four lines arrived as one QQ bubble.
+        """
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        transport.snapshot = ContextSnapshot(text="状态", version="9")
+
+        from astrbot.api.provider import ProviderRequest
+
+        request = ProviderRequest(prompt="在吗")
+        await self._handler("on_llm_request")(self.plugin, StubMessageEvent(), request)
+
+        text = request.extra_user_content_parts[0].text
+        self.assertIn("宿主说明", text)
+        self.assertIn("纯文字不要用它", text)
+        self.assertLess(text.index("</companion_runtime_context>"), text.index("宿主说明"))
+
+    async def test_a_cron_run_still_gets_the_context_block(self) -> None:
+        """A cron run never passes the pipeline, so ``on_agent_begin`` carries the block.
+
+        Measured on the beta: a 21:45 cron turn left no ``context_rendered`` event behind,
+        which means she answered with her persona and the transcript but none of the
+        Runtime's cognition.
+        """
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        transport.snapshot = ContextSnapshot(text="状态", version="9")
+        run_context = SimpleNamespace(messages=[])
+
+        await self._handler("on_agent_begin")(
+            self.plugin,
+            StubMessageEvent(platform="cron"),
+            run_context,
+        )
+
+        self.assertEqual(len(run_context.messages), 1)
+        content = run_context.messages[0].content[0]
+        self.assertTrue(content._no_save, "hidden context must never be persisted")
+        self.assertIn("状态", content.text)
+        self.assertIn("定时任务叫醒的", content.text)
+        self.assertIn("一条一次", content.text)
+
+    async def test_a_run_that_already_has_the_block_is_left_alone(self) -> None:
+        """The pipeline injected this run; a second copy would only repeat it."""
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        transport.snapshot = ContextSnapshot(text="状态", version="9")
+        event = StubMessageEvent()
+        run_context = SimpleNamespace(messages=[])
+
+        from astrbot.api.provider import ProviderRequest
+
+        await self._handler("on_llm_request")(self.plugin, event, ProviderRequest(prompt="在吗"))
+        await self._handler("on_agent_begin")(self.plugin, event, run_context)
+
+        self.assertEqual(run_context.messages, [])
 
     # -- outbox ------------------------------------------------------------
 

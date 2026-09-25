@@ -25,3 +25,11 @@ class TextPart(ContentPart):
     def __init__(self, text: str = "") -> None:
         super().__init__()
         self.text = text
+
+
+class Message:
+    """Mirrors ``Message(role=..., content=[part, ...])``."""
+
+    def __init__(self, role: str = "user", content: list[ContentPart] | str = "") -> None:
+        self.role = role
+        self.content = content if isinstance(content, list) else [TextPart(text=content)]

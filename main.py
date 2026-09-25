@@ -62,8 +62,9 @@ except ImportError:  # pragma: no cover - defensive
     from astrbot.core.star.filter.custom_filter import CustomFilter  # type: ignore
 
 try:  # documented since AstrBot v4.24.0 (``TextPart.mark_as_temp``)
-    from astrbot.core.agent.message import TextPart
+    from astrbot.core.agent.message import Message, TextPart
 except ImportError:  # pragma: no cover - defensive
+    Message = None  # type: ignore[assignment]
     TextPart = None  # type: ignore[assignment]
 
 #: Queue payload discriminators.
@@ -90,6 +91,36 @@ ASSISTANT_REPORTED_EXTRA = "companion_runtime_assistant_reported"
 #: this session. Its own message tool writes it and its respond stage reads it to avoid
 #: sending the same text twice.
 SENT_PLAIN_TEXTS_EXTRA = "_send_message_to_user_current_session_plain_texts"
+
+#: Event extra marking that this run already carries the Runtime block. The pipeline injects
+#: it through ``on_llm_request``; a run started by something else (a cron job, a
+#: background-task wake) is picked up by ``on_agent_begin`` instead, and this keeps the two
+#: from stacking on the same run.
+CONTEXT_INJECTED_EXTRA = "companion_runtime_context_injected"
+
+#: How the host delivers what she says. Host mechanics, deliberately terse and marked as
+#: such: prose about message-sending leaks into the register of what she writes back.
+#:
+#: The plain-text rule exists because ``result_decorate`` is what splits her reply into
+#: bubbles, and a message sent through ``send_message_to_user`` never passes through that
+#: stage - measured on the beta (xin, 2026-09-25 21:45), four lines arrived as one QQ bubble.
+HOST_DELIVERY_NOTE = (
+    "（宿主说明，不是她脑子里的事）\n"
+    "- 要说的话直接当正文输出：宿主会按句子把它们拆成几条发出去。\n"
+    "- 要发图片/文件/语音，或者要发到别的会话，才用 send_message_to_user；纯文字不要用它 ——"
+    " 那个工具一次调用在 QQ 里只算一条气泡，几行塞进一条会挤成一坨。"
+)
+
+#: The same, for a run a cron job woke. There the completion text is not delivered at all -
+#: the job path says so itself ("agent will send message to user via using tools") - so the
+#: rule inverts: the tool is the only way out, and one bubble means one tool call.
+HOST_DELIVERY_NOTE_CRON = (
+    "（宿主说明，不是她脑子里的事）\n"
+    "- 这一轮是定时任务叫醒的：正文不会发给用户，要对他说的话必须用 send_message_to_user 发。\n"
+    "- 一条一次：要说三句就调用三次，每次 messages 里只放一条。那个工具一次调用在 QQ 里只算一条气泡，"
+    "几行塞进一条会挤成一坨。\n"
+    "- 不要写「我做了什么」的汇报或总结，把要对他说的话本身发出去。"
+)
 
 #: AstrBot's plugin whitelist. A non-wildcard list is applied to every handler
 #: lookup, so a plugin missing from it keeps loading and keeps running its
@@ -150,6 +181,25 @@ def _message_type_name(event: AstrMessageEvent) -> str:
     value = getattr(message_type, "value", message_type)
     raw = as_str(value).strip().lower()
     return MESSAGE_TYPE_NAMES.get(raw, raw)
+
+
+def _is_cron_event(event: AstrMessageEvent) -> bool:
+    """Return whether AstrBot started this run from a scheduled task.
+
+    A cron run is a synthetic event whose platform is literally ``cron`` (measured on the
+    beta: ``platform: "cron"``, ``sender_id: "astrbot"``), and its delivery rules are the
+    opposite of a chat turn's, so the two need different host notes.
+
+    Args:
+        event: The AstrBot event being reported.
+
+    Returns:
+        True when the event came from AstrBot's own scheduler.
+    """
+    try:
+        return "cron" in as_str(event.get_platform_name()).strip().lower()
+    except Exception:
+        return False
 
 
 def _event_is_stopped(event: AstrMessageEvent) -> bool:
@@ -829,9 +879,6 @@ class CompanionRuntimePlugin(Star):
 
     async def _inject_context(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         """Fetch and append the Runtime context block, fail-open on any problem."""
-        bridge = self._bridge_for(as_str(event.unified_msg_origin))
-        if bridge is None or not self._settings.inject_enabled:
-            return
         if TextPart is None:
             self._warn_injection_once(
                 "missing-textpart",
@@ -840,9 +887,7 @@ class CompanionRuntimePlugin(Star):
             )
             return
 
-        text = await bridge.text_for_llm_request(
-            self._context_request(event, trigger=TRIGGER_LLM_REQUEST),
-        )
+        text = await self._runtime_text(event)
         if not text:
             return
 
@@ -856,7 +901,7 @@ class CompanionRuntimePlugin(Star):
             return
 
         try:
-            part = TextPart(text=text)
+            part = TextPart(text=text + "\n\n" + HOST_DELIVERY_NOTE)
             mark_as_temp = getattr(part, "mark_as_temp", None)
             if not callable(mark_as_temp):
                 # Without mark_as_temp the hidden context could be written into
@@ -868,8 +913,62 @@ class CompanionRuntimePlugin(Star):
                 )
                 return
             parts.append(mark_as_temp())
+            self._mark_context_injected(event)
         except Exception:
             self.logger.debug("companion_runtime could not append the context part", exc_info=True)
+
+    async def _runtime_text(self, event: AstrMessageEvent) -> str:
+        """Return the Runtime's injection block for this session, or an empty string."""
+        bridge = self._bridge_for(as_str(event.unified_msg_origin))
+        if bridge is None or not self._settings.inject_enabled:
+            return ""
+        return await bridge.text_for_llm_request(
+            self._context_request(event, trigger=TRIGGER_LLM_REQUEST),
+        )
+
+    @filter.on_agent_begin()
+    async def on_agent_begin(self, event: AstrMessageEvent, run_context: Any) -> None:
+        """Carry the Runtime block into a run the message pipeline did not start.
+
+        ``on_llm_request`` only fires inside the message pipeline, so a cron job
+        (``future_task``) or a background-task wake never receives the Runtime's context:
+        measured on the beta (2026-09-25) a 21:45 cron turn left no ``context_rendered``
+        event behind at all, which means she spoke with her persona and the transcript but
+        none of the cognition the Runtime holds. ``on_agent_begin`` does fire for those runs,
+        and by then the runner has already built ``run_context.messages`` from the request,
+        so the block can still be added. It is added to the run only: the host persists the
+        *request* afterwards, not the run context.
+        """
+        try:
+            if self._context_injected(event):
+                return
+            text = await self._runtime_text(event)
+            messages = getattr(run_context, "messages", None)
+            if not text or Message is None or TextPart is None or not isinstance(messages, list):
+                return
+            note = HOST_DELIVERY_NOTE_CRON if _is_cron_event(event) else HOST_DELIVERY_NOTE
+            part = TextPart(text=text + "\n\n" + note)
+            mark_as_temp = getattr(part, "mark_as_temp", None)
+            if callable(mark_as_temp):
+                part = mark_as_temp()
+            messages.append(Message(role="user", content=[part]))
+            self._mark_context_injected(event)
+        except Exception:
+            self.logger.debug("companion_runtime could not decorate this run", exc_info=True)
+
+    def _context_injected(self, event: AstrMessageEvent) -> bool:
+        """Return whether this run already carries the Runtime block."""
+        try:
+            return bool(event.get_extra(CONTEXT_INJECTED_EXTRA, False))
+        except Exception:
+            return False
+
+    def _mark_context_injected(self, event: AstrMessageEvent) -> None:
+        """Remember that this run carries the Runtime block."""
+        try:
+            event.set_extra(CONTEXT_INJECTED_EXTRA, True)
+        except Exception:
+            self.logger.debug("companion_runtime could not mark the injected run")
 
     # ------------------------------------------------------------------
     # Runtime calls

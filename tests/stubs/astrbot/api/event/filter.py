@@ -119,6 +119,22 @@ def on_llm_response(**kwargs: Any):
     return decorator
 
 
+def on_agent_begin(**kwargs: Any):
+    """Stub of ``@filter.on_agent_begin``.
+
+    The real hook fires at the start of every agent run - including the runs AstrBot starts
+    by itself (a cron job waking the agent, a background task completing), which never pass
+    through the message pipeline and so never trigger ``on_llm_request``.
+    """
+
+    def decorator(handler):
+        _record("on_agent_begin", handler.__name__, handler)
+        return handler
+
+    del kwargs
+    return decorator
+
+
 def after_message_sent(**kwargs: Any):
     """Stub of ``@filter.after_message_sent``."""
 
