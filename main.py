@@ -86,6 +86,11 @@ AUTO_PROVISION_LIMIT = 64
 #: Event extra that records an assistant turn already reported for this message.
 ASSISTANT_REPORTED_EXTRA = "companion_runtime_assistant_reported"
 
+#: Event extra where AstrBot records what ``send_message_to_user`` actually delivered in
+#: this session. Its own message tool writes it and its respond stage reads it to avoid
+#: sending the same text twice.
+SENT_PLAIN_TEXTS_EXTRA = "_send_message_to_user_current_session_plain_texts"
+
 #: AstrBot's plugin whitelist. A non-wildcard list is applied to every handler
 #: lookup, so a plugin missing from it keeps loading and keeps running its
 #: background workers while none of its hooks ever fire.
@@ -642,11 +647,18 @@ class CompanionRuntimePlugin(Star):
         the rendered chain would be (a long reply is delivered as a rendered
         *image*, which carries no words).
 
+        The one case where that text is *not* what the user received is a turn that
+        delivered through ``send_message_to_user`` - then the completion is the model's
+        narration about the message it just sent, and the delivered text is what counts
+        (see :meth:`_delivered_text`).
+
         The turn is marked so ``after_message_sent`` cannot report it twice on a
         host that does run that hook.
         """
         try:
-            text = as_str(getattr(response, "completion_text", "")).strip()
+            text = self._delivered_text(event) or as_str(
+                getattr(response, "completion_text", "")
+            ).strip()
             if text and self._report_assistant(event, text):
                 self._mark_assistant_reported(event)
         except Exception:
@@ -1245,6 +1257,35 @@ class CompanionRuntimePlugin(Star):
             return as_str(result.get_plain_text()).strip()
         except Exception:
             return ""
+
+    @staticmethod
+    def _delivered_text(event: AstrMessageEvent) -> str:
+        """Return what ``send_message_to_user`` delivered this turn, if it was used.
+
+        ``response.completion_text`` is the model's final *text output*, and when the turn
+        delivered through the send tool that output is not the message. Measured on the beta
+        (2026-09-25): the tool sent 「洗完没有呀……都半个多小时了，我就盯着这个框看」 while the
+        completion read 「已经发了。就一条，软的、拖着尾音的，问他洗完没有、头发擦了没」 - a
+        narration *about* the message. Reporting that told the Runtime she had said something
+        the user never saw, and the render prompt's "don't say this again" block then handed
+        the narration back to her as something to avoid.
+
+        AstrBot stashes the delivered plain texts on the event, so prefer those; the bubbles
+        are joined with a newline, the same shape a multi-bubble reply already reports as.
+
+        Args:
+            event: The message event for this turn.
+
+        Returns:
+            The delivered text, or an empty string when the turn did not deliver by tool.
+        """
+        try:
+            texts = event.get_extra(SENT_PLAIN_TEXTS_EXTRA, [])
+        except Exception:
+            return ""
+        if not isinstance(texts, (list, tuple)):
+            return ""
+        return "\n".join(part for part in (as_str(item).strip() for item in texts) if part)
 
     @filter.command("companion_runtime")
     async def companion_runtime_status(self, event: AstrMessageEvent):

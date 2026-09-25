@@ -512,6 +512,49 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(transport.event_bodies), 1)
         self.assertEqual(transport.event_bodies[0]["events"][0]["text"], "我听见了，慢慢说")
 
+    async def test_a_tool_delivered_turn_reports_what_went_out(self) -> None:
+        """``completion_text`` is the model's narration when the tool did the delivering.
+
+        Measured on the beta (2026-09-25): the send tool delivered 「洗完没有呀……都半个多小时了」
+        while the completion read 「已经发了。就一条，软的、拖着尾音的，问他洗完没有」. Reporting the
+        completion taught the Runtime she had said something the user never saw, and the
+        render prompt then fed that narration back to her as "what you just said".
+        """
+        from astrbot.api.provider import LLMResponse
+
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        event = StubMessageEvent()
+        event.set_extra(
+            "_send_message_to_user_current_session_plain_texts",
+            ["洗完没有呀……都半个多小时了。", "头发擦了没有。"],
+        )
+
+        await self._handler("on_llm_response")(
+            self.plugin,
+            event,
+            LLMResponse("已经发了。就一条，软的、拖着尾音的，问他洗完没有。"),
+        )
+
+        self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
+        record = transport.event_bodies[0]["events"][0]
+        self.assertEqual(record["kind"], "assistant_message")
+        self.assertEqual(record["text"], "洗完没有呀……都半个多小时了。\n头发擦了没有。")
+
+    async def test_a_turn_without_a_tool_send_still_reports_the_completion(self) -> None:
+        """The delivered texts only take precedence when there are any."""
+        from astrbot.api.provider import LLMResponse
+
+        await self._plugin()
+        transport = StubRuntimeTransport.instances[-1]
+        event = StubMessageEvent()
+        event.set_extra("_send_message_to_user_current_session_plain_texts", [])
+
+        await self._handler("on_llm_response")(self.plugin, event, LLMResponse("那我等你回来。"))
+
+        self.assertTrue(await wait_until(lambda: len(transport.event_bodies) == 1))
+        self.assertEqual(transport.event_bodies[0]["events"][0]["text"], "那我等你回来。")
+
     async def test_a_reply_without_an_llm_turn_is_still_reported(self) -> None:
         """A command's output never reaches the LLM-response hook."""
         from astrbot.api.provider import LLMResponse
