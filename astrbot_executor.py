@@ -140,10 +140,21 @@ class AstrBotActionExecutor:
             raise ActionExecutionError(f"llm_generate failed: {truncate_error(exc)}") from exc
 
         text = as_str(getattr(response, "completion_text", "")).strip()
+        declared = action.payload.get("completion_metadata")
+        completion_metadata = (
+            dict(declared)
+            if isinstance(declared, dict)
+            else {
+                "claims_completion": False,
+                "task_ref": None,
+                "witness_requirement": None,
+            }
+        )
         result: dict[str, Any] = {
             "text": text,
             "provider_id": provider_id,
             "chars": len(text),
+            "render_metadata": completion_metadata,
         }
         max_chars = as_int(action.payload.get("max_chars"), 0)
         if max_chars > 0 and len(text) > max_chars:
