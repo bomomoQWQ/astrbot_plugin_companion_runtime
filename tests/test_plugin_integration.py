@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -279,6 +280,8 @@ class PluginIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.skipTest("a real AstrBot installation is importable; stub would mislead")
 
     async def asyncSetUp(self) -> None:
+        self._plugin_data = tempfile.TemporaryDirectory()
+        self.main.StarTools._root = Path(self._plugin_data.name)
         self._original_transport = self.main.AiohttpRuntimeTransport
         self.main.AiohttpRuntimeTransport = StubRuntimeTransport
         StubRuntimeTransport.instances = []

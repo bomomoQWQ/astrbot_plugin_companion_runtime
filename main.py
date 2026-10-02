@@ -31,7 +31,7 @@ from typing import Any
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 
 from .astrbot_executor import AstrBotActionExecutor
 from .companion_runtime.bridge import ContextBridge
@@ -54,6 +54,7 @@ from .companion_runtime.protocol import (
     truncate_error,
 )
 from .companion_runtime.retry_queue import BoundedRetryQueue, QueueItem
+from .companion_runtime.sent_ledger import SentLedger
 from .companion_runtime.settings import OBSERVE_MODE_ALL, SHUTDOWN_GRACE_S, Settings
 
 try:  # the documented import path for provider-facing content parts
@@ -471,13 +472,20 @@ class CompanionRuntimePlugin(Star):
                     url=url,
                 )
             consumers: list[OutboxConsumer] = []
+            ledger = None
             if self._settings.outbox_enabled:
+                ledger_path = StarTools.get_data_dir(
+                    "astrbot_plugin_companion_runtime",
+                ) / "sent_ledger.sqlite3"
+                ledger = SentLedger(ledger_path)
                 for url, target in targets.items():
                     consumer = OutboxConsumer(
                         transport=target.transport,
                         executor=executor,
                         reporter=self._target_reporter(url),
                         settings=self._settings,
+                        sent_ledger=ledger,
+                        ledger_namespace=url,
                         log=self.logger,
                     )
                     target.outbox = consumer

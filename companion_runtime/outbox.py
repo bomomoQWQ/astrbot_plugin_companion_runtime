@@ -61,6 +61,7 @@ from .protocol import (
     truncate_error,
 )
 from .retry_queue import NULL_LOG
+from .sent_ledger import SentLedgerConflict, SentLedgerUnavailable
 from .settings import Settings
 
 #: How many finished action reports are remembered for duplicate suppression.
@@ -121,6 +122,8 @@ class OutboxConsumer:
         executor: ActionExecutor,
         reporter: Callable[[ActionReport], Awaitable[None]],
         settings: Settings,
+        sent_ledger: Any | None = None,
+        ledger_namespace: str = "",
         clock: Any = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         log: Any = NULL_LOG,
@@ -133,6 +136,11 @@ class OutboxConsumer:
             reporter: Coroutine reporting an :class:`ActionReport`; it owns
                 retrying, and must not raise.
             settings: Normalized adapter settings.
+            sent_ledger: Durable platform-send witness. ``None`` preserves the
+                historical in-memory-only behavior for standalone/tests; the real
+                plugin always injects one and fails construction if unavailable.
+            ledger_namespace: Runtime target identity, isolating equal outbox ids
+                leased from different per-user Runtime instances.
             clock: Monotonic clock source (injectable for tests).
             sleep: Sleep function (injectable for tests).
             log: Logger-like object.
@@ -141,6 +149,8 @@ class OutboxConsumer:
         self._executor = executor
         self._reporter = reporter
         self._settings = settings
+        self._sent_ledger = sent_ledger
+        self._ledger_namespace = ledger_namespace.strip()
         self._clock = clock
         self._sleep = sleep
         self._log = log
@@ -448,6 +458,38 @@ class OutboxConsumer:
             )
 
         final_text = decision.text.strip() or text
+        ledger = self._sent_ledger
+        if ledger is not None:
+            try:
+                ledger_state, ledger_record = ledger.reserve(
+                    namespace=self._ledger_namespace,
+                    session=action.session,
+                    outbox_id=action.action_id,
+                    attempt_id=action.attempt_id,
+                    text=final_text,
+                )
+            except (SentLedgerUnavailable, SentLedgerConflict) as exc:
+                self.stats.deferred += 1
+                self._log.error(
+                    "send for %s blocked by durable ledger: %s",
+                    action.action_id,
+                    truncate_error(exc),
+                )
+                return None
+            if ledger_state == "sent":
+                self.stats.replayed += 1
+                return self._report(action, STATUS_OK, result=dict(ledger_record.result))
+            if ledger_state == "sending":
+                # The old process may have crashed after the platform accepted the
+                # message.  Ambiguity must never turn into a second delivery.
+                self.stats.deferred += 1
+                self._log.warning(
+                    "send for %s has an unresolved durable reservation; platform "
+                    "delivery suppressed",
+                    action.action_id,
+                )
+                return None
+
         try:
             result = await self._settle(
                 asyncio.ensure_future(
@@ -460,6 +502,21 @@ class OutboxConsumer:
         except asyncio.CancelledError:
             raise
         except TransportUnavailable as exc:
+            if ledger is not None:
+                try:
+                    ledger.abandon(
+                        namespace=self._ledger_namespace,
+                        session=action.session,
+                        outbox_id=action.action_id,
+                        attempt_id=action.attempt_id,
+                        text=final_text,
+                    )
+                except (SentLedgerUnavailable, SentLedgerConflict) as ledger_exc:
+                    self._log.error(
+                        "could not release durable reservation for %s: %s",
+                        action.action_id,
+                        truncate_error(ledger_exc),
+                    )
             # Same policy as an authorization outage, for the same reason: the
             # platform link was down, so nothing was delivered and nothing should be
             # reported. Reporting it would make the Runtime close the attempt for
@@ -495,6 +552,21 @@ class OutboxConsumer:
         delivered = as_bool(payload.get("sent"), False)
         payload["authorized"] = True
         if not delivered:
+            if ledger is not None:
+                try:
+                    ledger.abandon(
+                        namespace=self._ledger_namespace,
+                        session=action.session,
+                        outbox_id=action.action_id,
+                        attempt_id=action.attempt_id,
+                        text=final_text,
+                    )
+                except (SentLedgerUnavailable, SentLedgerConflict) as exc:
+                    self._log.error(
+                        "could not release durable reservation for %s: %s",
+                        action.action_id,
+                        truncate_error(exc),
+                    )
             self.stats.failed += 1
             return self._report(
                 action,
@@ -502,6 +574,28 @@ class OutboxConsumer:
                 error=as_str(payload.get("reason")) or "delivery_failed",
                 result=payload,
             )
+        if ledger is not None:
+            try:
+                ledger.mark_sent(
+                    namespace=self._ledger_namespace,
+                    session=action.session,
+                    outbox_id=action.action_id,
+                    attempt_id=action.attempt_id,
+                    text=final_text,
+                    result=payload,
+                )
+            except (SentLedgerUnavailable, SentLedgerConflict) as exc:
+                # The platform has already accepted the message.  Do not report a
+                # verdict which could make Runtime retry, and never send this identity
+                # again: its reservation remains the fail-closed witness.
+                self.stats.deferred += 1
+                self._log.error(
+                    "platform sent %s but durable success write failed: %s; Runtime "
+                    "ACK suppressed to prevent redelivery",
+                    action.action_id,
+                    truncate_error(exc),
+                )
+                return None
         self.stats.sent += 1
         return self._report(action, STATUS_OK, result=payload)
 
