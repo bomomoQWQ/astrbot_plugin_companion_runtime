@@ -37,7 +37,7 @@ import asyncio
 import hashlib
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Protocol
 
 from .coerce import as_bool, as_str
@@ -269,7 +269,7 @@ class OutboxConsumer:
             # stored report instead of sending or rendering a second time.
             self._completed.move_to_end(key)
             self.stats.replayed += 1
-            await self._safe_report(previous)
+            await self._safe_report(self._readdress(previous, action))
             return
         if key in self._inflight:
             self.stats.duplicate_inflight += 1
@@ -687,6 +687,25 @@ class OutboxConsumer:
         self._completed.move_to_end(key)
         while len(self._completed) > COMPLETED_CACHE_SIZE:
             self._completed.popitem(last=False)
+
+    def _readdress(self, report: ActionReport, action: LeasedAction) -> ActionReport:
+        """Point a stored outcome at the claim that is asking for it now.
+
+        A re-lease keeps the same ``attempt_id``, so the replay path answers it from the
+        report already on file -- but that report was written under the *first* lease. Sent
+        verbatim it answers a claim the Runtime has already retired, which refuses it as
+        ``stale_lease`` and re-leases the row until its attempts run out: work that
+        succeeded is then never delivered. The outcome is unchanged; only the lease it
+        answers is brought up to date. Answering the current claim is also what keeps a
+        completed send from being dispatched a second time.
+        """
+        if report.lease_id == action.lease_id and report.attempt_id == action.attempt_id:
+            return report
+        return replace(
+            report,
+            lease_id=action.lease_id,
+            attempt_id=action.attempt_id or report.attempt_id,
+        )
 
     def _poll_backoff(self) -> float:
         """Return the backoff delay after consecutive lease failures."""

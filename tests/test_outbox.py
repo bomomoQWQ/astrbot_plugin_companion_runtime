@@ -440,6 +440,43 @@ class OutboxConsumerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(collector.reports), 2)
         self.assertEqual(consumer.stats.replayed, 1)
 
+    async def test_a_redelivery_is_answered_under_the_claim_asking_now(self) -> None:
+        """A re-leased action must be answered with the lease id that is current.
+
+        The duplicate-suppression key is ``(action_id, attempt_id)`` and a redelivery keeps
+        the attempt, so the stored report is replayed -- but that report was written under
+        the first lease. Sent verbatim it answers a claim the Runtime has already retired,
+        which refuses it as ``stale_lease`` and re-leases the row until its attempts run
+        out. Work that succeeded is then never delivered, which is exactly what happened to
+        the first proactive renders in production.
+        """
+        first = _action(action_type=ACTION_RENDER, payload={"prompt": "写一句话"})
+        redelivered = LeasedAction(
+            action_id=first.action_id,
+            action_type=first.action_type,
+            lease_id="lease_redelivered_2",
+            session=first.session,
+            attempt_id=first.attempt_id,
+            lease_ttl_ms=first.lease_ttl_ms,
+            payload=dict(first.payload),
+        )
+        transport = FakeTransport(actions=[first])
+        executor = FakeExecutor(render_text="在忙什么呢")
+        consumer, collector = self._consumer(transport, executor)
+
+        await consumer.poll_once()
+        transport.actions = [redelivered]
+        await consumer.poll_once()
+
+        self.assertEqual(consumer.stats.replayed, 1)
+        self.assertEqual(len(executor.render_calls), 1, "the work must not be redone")
+        self.assertEqual(
+            [report.lease_id for report in collector.reports],
+            [first.lease_id, redelivered.lease_id],
+        )
+        self.assertEqual(collector.reports[1].status, STATUS_OK)
+        self.assertEqual(collector.reports[1].result.get("text"), "在忙什么呢")
+
     async def test_duplicate_lease_is_not_executed_twice_in_one_batch(self) -> None:
         action = _action(payload={"text": "只发一次"})
         transport = FakeTransport(actions=[action, action])
