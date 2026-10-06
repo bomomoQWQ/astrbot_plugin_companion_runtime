@@ -381,7 +381,7 @@ class OutboxConsumer:
             error=f"unsupported_action_type:{action.action_type or 'missing'}",
         )
 
-    async def _render(self, action: LeasedAction) -> ActionReport:
+    async def _render(self, action: LeasedAction) -> ActionReport | None:
         """Render with the session's current provider while holding the lease."""
         try:
             result = await asyncio.wait_for(
@@ -391,12 +391,22 @@ class OutboxConsumer:
         except asyncio.CancelledError:
             raise
         except (asyncio.TimeoutError, TimeoutError):
-            self.stats.failed += 1
-            return self._stub(
-                action,
-                STATUS_FAILED,
-                error=f"render timed out after {self._settings.render_timeout_s:.0f}s",
+            # The model gave no answer: nothing was rendered and nothing was sent, so this
+            # is not a verdict about the message -- the render step was simply unavailable.
+            # Leave the row unreported and let the Runtime's own lease-expiry recovery hand
+            # it back, exactly as a send does when it cannot reach the Runtime. That path is
+            # bounded by the row's attempt budget, so a provider that stays broken retires
+            # the row instead of re-rendering forever. Reporting a terminal failure here
+            # instead dropped a message the character had already decided to send: five in
+            # two days, each one leaving its round unsettled as well.
+            self.stats.deferred += 1
+            self._log.warning(
+                "render for %s timed out after %.0fs; message NOT rendered and left to "
+                "the Runtime's lease-expiry recovery",
+                action.action_id,
+                self._settings.render_timeout_s,
             )
+            return None
         except Exception as exc:
             self.stats.failed += 1
             return self._stub(action, STATUS_FAILED, error=truncate_error(exc))

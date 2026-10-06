@@ -111,7 +111,14 @@ class OutboxConsumerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("no provider", report.error)
         self.assertEqual(consumer.stats.failed, 1)
 
-    async def test_render_timeout_is_bounded(self) -> None:
+    async def test_a_render_timeout_is_left_to_the_runtime_to_retry(self) -> None:
+        """A timed-out render must not be reported as a verdict.
+
+        The model gave no answer: nothing was rendered and nothing was sent, so the honest
+        report is none at all. The Runtime's own lease-expiry recovery then hands the row
+        back for another attempt, bounded by the row's attempt budget. Reporting a terminal
+        failure here retired the row and lost a message the character had chosen to send.
+        """
         action = _action(action_type=ACTION_RENDER, payload={"prompt": "compose"})
         transport = FakeTransport(actions=[action])
         executor = FakeExecutor(render_delay_s=0.5)
@@ -134,8 +141,25 @@ class OutboxConsumerTests(unittest.IsolatedAsyncioTestCase):
 
         await consumer.poll_once()
 
+        self.assertEqual(collector.reports, [], "an outage is not an outcome")
+        self.assertEqual(consumer.stats.deferred, 1)
+        self.assertEqual(consumer.stats.failed, 0, "nothing was decided against the message")
+        self.assertFalse(
+            consumer._completed,
+            "a deferred action must stay re-leaseable or the retry can never happen",
+        )
+
+    async def test_a_render_that_errors_is_still_reported_as_a_failure(self) -> None:
+        """Only the transient case is deferred; a real renderer error is a verdict."""
+        action = _action(action_type=ACTION_RENDER, payload={"prompt": "compose"})
+        transport = FakeTransport(actions=[action])
+        executor = FakeExecutor(render_error=RuntimeError("provider refused"))
+        consumer, collector = self._consumer(transport, executor)
+
+        await consumer.poll_once()
+
         self.assertEqual(collector.reports[0].status, STATUS_FAILED)
-        self.assertIn("timed out", collector.reports[0].error)
+        self.assertEqual(consumer.stats.deferred, 0)
 
     async def test_empty_render_result_is_a_failure(self) -> None:
         action = _action(action_type=ACTION_RENDER, payload={"prompt": "compose"})
