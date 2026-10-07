@@ -827,8 +827,9 @@ python -m pytest tests -q          # 或：python -m unittest discover -s tests 
   `semantic_provider` 与 `semantics.unresolved` 两行（§4.8）；该探测是 fail-open 的，
   失败时只多一行 `cognition: unavailable`。插件没有任何与生成式模型相关的配置项或探测逻辑
   ——Runtime 默认不接模型（§0.2），这是设计选择，不是遗漏。
-- **v0.2 现状（实现侧待修）**：状态命令读取 `semantic_provider["name"]`，而 Runtime 报的字段名是
-  `provider`，因此真实 Runtime 上第一行目前显示 `semantic_provider: unknown (...)`（§4.8）。
+- **v0.2 现状**：状态命令优先读 `semantic_provider["provider"]`（Runtime 实际报的字段名），
+  再回退到早期草案用的 `name`，两者都没有才显示 `unknown`——版本错位时降级成「标签不准」，
+  而不是降级成 `unknown`（`main.py::_semantic_status_lines()`，§4.8）。
 
 ---
 
@@ -853,12 +854,13 @@ python -m pytest tests -q          # 或：python -m unittest discover -s tests 
    以及「Runtime 不提供 `/health` 时状态命令仍然可用」的 fail-open 行为。
 3. **README §4.8** 已按现状改写（不再是「已知差距」）。
 
-仍然遗留的一点（**未修，只记录**）：
+**曾经遗留、现已修复的一点**（保留记录，便于追溯）：
 
-- 状态命令读的是 `semantic_provider["name"]`，而 Runtime `/health` 报的键是 `provider`，
-  于是真实部署下这一行会显示 `unknown`。最小修复是在 `main.py` 里把 `provider.get("name")`
-  改成 `provider.get("name") or provider.get("provider")`，并按现状补一条断言。
-  本文档不动 `.py`，因此只在此声明。
+- 当时状态命令只读 `semantic_provider["name"]`，而 Runtime `/health` 报的键是 `provider`，
+  于是真实部署下这一行会显示 `unknown`。实际修复方式与当时预测的略有不同：
+  `main.py::_semantic_status_lines()` 现在是 `provider.get("provider") or provider.get("name")`，
+  **优先**读 Runtime 实际使用的键，把旧的 `name` 留作回退；断言覆盖了两种响应形状
+  （`tests/test_plugin_integration.py`）。当时「本文档不动 `.py`」的限制已不再适用。
 
 ---
 
@@ -880,3 +882,31 @@ python -m pytest tests -q          # 或：python -m unittest discover -s tests 
   投递时按宿主自己的规则切分并逐条发送（只切分不改写、绝不丢字、部分成功按实际发出回报）。
   另修：交付历史只写真正发出去的内容。离线测试 **204 项**（新增 `tests/test_segments.py`
   与 4 条投递集成测试）。
+- `0.5.0`：**第一次真正发版**。此前 `metadata.yaml` 从 0.1.0 起没有动过，仓库里也没有 tag
+  ——上面几条虽然写着「未发版」，实际上整个插件从来没有发布过，只有 main 上的最新提交。
+  本次补齐版本号、本节和发版流程。版本号与 Runtime **同号**（主仓库 `CHANGELOG.md` 顶部那条
+  约定），但**兼容性不由这个号决定**：插件↔Runtime 的契约是 `PROTOCOL_VERSION` /
+  `RUNTIME_API_VERSION`（当前都是 `"1"`），插件↔AstrBot 的契约是 `astrbot_version: ">=4.28,<5"`。
+  三个真缺陷，全部来自生产：
+
+  1. **发送账本**（`companion_runtime/sent_ledger.py`）：不可逆的发送有了持久见证。此前进程若
+     死在「已经发出」与「已经记账」之间，重启后会**再开口一次**——账本让这件事可查。
+  2. 重投递按**当下正在问的那个租约**作答，而不是按那次旧的租约（同一会话连发两条时会答错）。
+  3. **渲染超时是故障，不是判词**：一次超时不再被当成「这条渲染不出来」而把消息丢掉。
+
+  离线测试 **217 项**（新增 `tests/test_sent_ledger.py`）。
+
+### 发版流程
+
+本插件**不在 AstrBot 插件市场**（市场发布已冻结，不是待办），交付靠仓库本身。发一版要做的事：
+
+1. 改本仓库 `metadata.yaml` 的 `version`，并把主仓库两处（`runtime/pyproject.toml`、
+   `runtime/src/companion_runtime/__init__.py`）改成同一个号；改完在主仓库根目录跑
+   `python3 scripts/check_versions.py` 确认四处一致（不一致会退出码 1）。
+2. 在本节**末尾**加一条（本节按时间从旧到新排列）；主仓库 `CHANGELOG.md` 同步。
+3. 门禁：`python -m pytest tests -q` 必须全绿（0.5.0 时是 `217 passed, 20 subtests passed`）。
+4. 提交，并打 tag：`git tag -a v0.5.0 -m "..."`。
+5. 交付二选一：克隆到 `AstrBot/data/plugins/astrbot_plugin_companion_runtime/`，
+   或把仓库打成 zip 用 AstrBot WebUI 的「安装插件」上传。
+   装完用插件的状态命令确认接上了 Runtime（`semantic_provider` 那行应显示真实 provider，
+   而不是 `unknown`）。

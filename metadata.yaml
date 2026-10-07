@@ -14,7 +14,7 @@ desc: >-
   未解释事件积压同样不影响本插件行为。
   单独安装本插件而不运行 Runtime 时，AstrBot 的行为与未安装时完全一致（fail-open）。
 author: bomomoQWQ
-version: 0.1.0
+version: 0.5.0
 repo: https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime
 astrbot_version: ">=4.28,<5"
 social_link: https://github.com/bomomoQWQ
