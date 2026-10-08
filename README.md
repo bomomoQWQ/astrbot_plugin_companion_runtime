@@ -106,7 +106,7 @@ git clone https://github.com/bomomoQWQ/astrbot_plugin_companion_runtime.git \
   写入永远只发生在 Runtime 内部（规则 / 统计 / 低频深层刷新 → Reducer）。
 - 因此，「主 LLM 当场表现」与「Runtime 持久状态」**不是同一权限**，插件两者都不改写。
 
-### 0.2 Runtime 默认不接任何模型，插件也不需要知道 provider 是什么
+### 0.2 插件不需要知道 provider 是什么；Runtime 默认选远端语义，没配端点时等同于不接模型
 
 - **本地生成式模型路线已被整体放弃**（补丁 §16、§17、§29 的最终形态）：Runtime 里没有
   任何本地权重、本地推理进程或本地端点，对应的实现、语法约束文件、训练与实验脚本
@@ -219,7 +219,7 @@ AstrBot/
 | `queue_send_timeout_ms` | `10000` | 队列单次投递超时 |
 | `debug` | `false` | 把超时/失败细节升级为 warning 级日志 |
 
-> **v0.2：配置里没有、也不会有任何模型相关的开关。** Runtime 默认不接任何模型（§0.2），
+> **v0.2：配置里没有、也不会有任何模型相关的开关。** Runtime 现在默认选 `remote_api`，但没配 base_url/model/key 时就是「不接模型」（§0.2），
 > 插件不探测模型进程、不管理权重、不做 warmup，也没有「语义 provider」相关配置项：
 > 这些完全属于 Runtime 侧（`semantic_provider` 见 §4.7）。插件对 `disabled` 与
 > `remote_api` 两种 Runtime 配置的行为**完全一致**。
@@ -576,7 +576,7 @@ Runtime 会把这段使用说明和优先级顺序一并写进注入文本内部
 
 **怎么读这两个块（v0.2 的运维认知）：**
 
-- `semantic_provider.provider == "disabled"` 是**完全正常的标准配置**，
+- `semantic_provider.available == false`（没配端点，或显式 `disabled`）是**完全正常的默认状态**，
   不是缺件、不是降级告警。此时粗粒度规则结算 + 确定性模板承担全部工作，
   `unresolved` 会更多，但长期连续性依然成立。
 - `semantics.unresolved` 上升**是设计中的正常状态**（补丁 §11、§12、§31）：
@@ -663,7 +663,7 @@ Runtime 的 Reducer 仍是唯一写者：深层刷新只产出**建议**，最�
   Runtime 不必马上硬猜；以后出现新证据时再回头重新解释，正是长期关系里很自然的叙事连续性。
 - 因此下列做法都是**错的**：把 `unresolved` 当成上报失败而重发事件；为降低计数而放宽置信门槛；
   在插件侧加「未解释事件补偿」逻辑。原始事件已经落库，重复上报只会被 `event_id` 幂等忽略。
-- `semantic_provider.provider == "disabled"`（标准配置）下 `unresolved` 会更多，这同样是正常的：
+- 没有可用语义端口时 `unresolved` 会更多，这同样是正常的：
   确定性模板 + 粗粒度规则足以维持长期连续性，只是「后来想明白」的能力更弱。
 
 ### 5.3 双层时间模型下双方的义务
